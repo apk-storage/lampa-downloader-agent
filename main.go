@@ -447,6 +447,14 @@ func (a *Agent) statusLoop() {
 // ---------- main ----------
 
 func main() {
+	// Native panel window mode: no engine, no re-exec — just the webview.
+	for _, a := range os.Args[1:] {
+		if len(a) > 9 && a[:9] == "--window=" {
+			runWindow(a[9:])
+			return
+		}
+	}
+
 	// The torrent storage package picks its file I/O in an init() that runs
 	// before main(), defaulting to mmap — which panics on Windows
 	// ("CreateFileMapping ... externally altered"). We can't set the env var in

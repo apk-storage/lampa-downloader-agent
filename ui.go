@@ -77,25 +77,6 @@ func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(panelHTML))
 }
 
-// openWindow shows the panel as an app-style window (chromeless) using an
-// installed browser in --app mode; falls back to the default browser.
-func openWindow(url string) {
-	switch runtime.GOOS {
-	case "windows":
-		for _, b := range []string{"msedge", "chrome"} {
-			c := exec.Command("cmd", "/c", "start", "", b, "--app="+url, "--window-size=580,760")
-			if c.Start() == nil {
-				return
-			}
-		}
-		exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		exec.Command("open", url).Start()
-	default:
-		exec.Command("xdg-open", url).Start()
-	}
-}
-
 const panelHTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lampa Downloader</title>
