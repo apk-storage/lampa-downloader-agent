@@ -8,6 +8,9 @@ on:
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,21 +24,34 @@ jobs:
       - name: Resolve dependencies
         run: go mod tidy
 
-      - name: Build (console — shows logs)
-        run: go build -o lampa-agent-console.exe .
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: '0'
+      - name: Build Windows (background + console)
+        env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '0' }
+        run: |
+          go build -ldflags "-H=windowsgui" -o lampa-agent.exe .
+          go build -o lampa-agent-console.exe .
 
-      - name: Build (background — no console window)
-        run: go build -ldflags "-H=windowsgui" -o lampa-agent.exe .
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: '0'
+      - name: Build macOS (Intel + Apple Silicon)
+        env: { GOOS: darwin, CGO_ENABLED: '0' }
+        run: |
+          GOARCH=amd64 go build -o lampa-agent-macos-intel .
+          GOARCH=arm64 go build -o lampa-agent-macos-arm .
 
-      - name: Upload
+      - name: Build Linux
+        env: { GOOS: linux, GOARCH: amd64, CGO_ENABLED: '0' }
+        run: go build -o lampa-agent-linux .
+
+      - name: Publish "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest \
+            --title "Lampa Downloader agent" \
+            --notes "Автоматическая сборка. Windows: lampa-agent.exe (фоновый) или lampa-agent-console.exe (с логами)." \
+            lampa-agent.exe lampa-agent-console.exe \
+            lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux
+
+      - name: Upload artifacts (fallback)
         uses: actions/upload-artifact@v4
         with:
           name: lampa-agent-exe
