@@ -13,7 +13,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -24,21 +27,20 @@ jobs:
       - name: Resolve dependencies
         run: go mod tidy
 
-      - name: Build Windows (background + console)
-        env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '0' }
+      - name: Build Windows (native webview, CGO)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '1'
         run: |
           go build -ldflags "-H=windowsgui" -o lampa-agent.exe .
           go build -o lampa-agent-console.exe .
 
-      - name: Build macOS (Intel + Apple Silicon)
-        env: { GOOS: darwin, CGO_ENABLED: '0' }
+      - name: Build macOS + Linux (cross, no CGO)
         run: |
-          GOARCH=amd64 go build -o lampa-agent-macos-intel .
-          GOARCH=arm64 go build -o lampa-agent-macos-arm .
-
-      - name: Build Linux
-        env: { GOOS: linux, GOARCH: amd64, CGO_ENABLED: '0' }
-        run: go build -o lampa-agent-linux .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o lampa-agent-macos-intel .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o lampa-agent-macos-arm .
+          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o lampa-agent-linux .
 
       - name: Publish "latest" release
         env:
@@ -47,7 +49,7 @@ jobs:
           gh release delete latest --cleanup-tag --yes || true
           gh release create latest \
             --title "Lampa Downloader agent" \
-            --notes "Автоматическая сборка. Windows: lampa-agent.exe (фоновый) или lampa-agent-console.exe (с логами)." \
+            --notes "Автосборка. Windows: lampa-agent.exe (фоновый, нативное окно) или lampa-agent-console.exe (с логами)." \
             lampa-agent.exe lampa-agent-console.exe \
             lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux
 
