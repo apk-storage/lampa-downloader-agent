@@ -1,0 +1,44 @@
+name: build-agent
+
+on:
+  push:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Resolve dependencies
+        run: go mod tidy
+
+      - name: Build (console — shows logs)
+        run: go build -o lampa-agent-console.exe .
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+
+      - name: Build (background — no console window)
+        run: go build -ldflags "-H=windowsgui" -o lampa-agent.exe .
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lampa-agent-exe
+          path: |
+            lampa-agent.exe
+            lampa-agent-console.exe
