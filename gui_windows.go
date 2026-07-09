@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"fyne.io/systray"
 	webview "github.com/webview/webview_go"
@@ -66,7 +67,9 @@ func pickDir() string {
 	ps := `Add-Type -AssemblyName System.Windows.Forms;` +
 		`$f=New-Object System.Windows.Forms.FolderBrowserDialog;` +
 		`if($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($f.SelectedPath)}`
-	out, err := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps).Output()
+	cmd := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}

@@ -24,6 +24,14 @@ func (a *Agent) startUI(addr string) {
 		}
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/api/setdir", func(w http.ResponseWriter, r *http.Request) {
+		dir := r.URL.Query().Get("dir")
+		if dir != "" {
+			a.setDir(dir)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
+	})
 	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
 		d := pickDir()
 		if d != "" {
@@ -95,6 +103,7 @@ func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 const panelHTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lampa Downloader</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232b7cff'/%3E%3Cpath d='M16 8v10m-5-5 5 5 5-5M10 24h12' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#1b1b1b;--card:#242424;--soft:#2e2e2e;--line:#333;--text:#f2f2f2;--muted:#8f8f8f;--ok:#5aa15a;--fill:#e8e8e8}
 *{box-sizing:border-box}
@@ -109,7 +118,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,S
 .code{display:flex;gap:8px}
 .code span{font-family:ui-monospace,Consolas,monospace;font-size:30px;font-weight:600;background:var(--soft);border-radius:8px;padding:6px 14px;letter-spacing:.05em}
 .dir{display:flex;align-items:center;gap:10px;margin-top:6px}
-.dir .path{font-family:ui-monospace,Consolas,monospace;font-size:13px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--soft);padding:8px 10px;border-radius:8px}
+.dir .path{font-family:ui-monospace,Consolas,monospace;font-size:13px;flex:1;min-width:0;background:var(--soft);color:var(--text);padding:8px 10px;border-radius:8px;border:.5px solid var(--line);outline:none}
 button{background:var(--soft);color:var(--text);border:.5px solid var(--line);border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
 button:hover{background:#383838}
 .dl{margin:14px 0}
@@ -129,7 +138,7 @@ button:hover{background:#383838}
 
 <div class="card">
   <div class="label">Папка загрузок</div>
-  <div class="dir"><div class="path" id="dir">—</div><button onclick="openDir()">Открыть</button><button onclick="changeDir()">Изменить</button></div>
+  <div class="dir"><input class="path" id="dir" spellcheck="false"><button onclick="saveDir()">Сохранить</button><button onclick="pickDir()">Обзор</button><button onclick="openDir()">Открыть</button></div>
 </div>
 
 <div class="card">
@@ -141,14 +150,15 @@ button:hover{background:#383838}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
 function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':'скачивание'}
 function openDir(){fetch('/api/opendir')}
-function changeDir(){fetch('/api/pickdir').then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').textContent=d.dir}).catch(function(){})}
+function saveDir(){var v=document.getElementById('dir').value;fetch('/api/setdir?dir='+encodeURIComponent(v)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
+function pickDir(){fetch('/api/pickdir').then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
 function cancelJob(id){if(confirm('Отменить эту загрузку?')){fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick)}}
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){fetch('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
     var code=document.getElementById('code');code.innerHTML='';
     (d.code||'').split(' ').join('').split('').forEach(function(c){var s=document.createElement('span');s.textContent=c;code.appendChild(s)});
-    document.getElementById('dir').textContent=d.dir||'—';
+    var di=document.getElementById('dir');if(document.activeElement!==di)di.value=d.dir||'';
     document.getElementById('dot').className='dot'+(d.relay?' on':'');
     document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';
     var box=document.getElementById('jobs');
