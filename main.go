@@ -78,11 +78,12 @@ var categoryDir = map[string]string{
 // ---------- agent ----------
 
 type Job struct {
-	id    string
-	name  string // kept locally for logs only; never sent to relay
-	t     *torrent.Torrent
-	state string // connecting|downloading|seeding|done
-	pct   int
+	id     string
+	name   string // kept locally for logs only; never sent to relay
+	magnet string // for pending removal on cancel
+	t      *torrent.Torrent
+	state  string // connecting|downloading|seeding|done
+	pct    int
 }
 
 type Agent struct {
@@ -323,6 +324,42 @@ func (a *Agent) onJob(m map[string]any) {
 // Windows ("CreateFileMapping ... externally altered"). Part files keep
 // partial data on disk, so an interrupted job resumes after a restart
 // (re-hashes what's there, continues from disk).
+// cancelJob stops a download, removes it, and forgets it so it won't resume.
+func (a *Agent) cancelJob(id string) {
+	a.mu.Lock()
+	j := a.jobs[id]
+	if j != nil {
+		delete(a.jobs, id)
+	}
+	a.mu.Unlock()
+	if j == nil {
+		return
+	}
+	if j.t != nil {
+		func() { defer func() { _ = recover() }(); j.t.Drop() }()
+	}
+	if j.magnet != "" {
+		a.removePending(j.magnet)
+	}
+	log.Printf("job %s cancelled: %q", id, j.name)
+}
+
+// setDir changes the download folder for future downloads.
+func (a *Agent) setDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("empty path")
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.cfg.DownloadDir = dir
+	a.mu.Unlock()
+	a.saveConfig()
+	log.Printf("download dir changed: %s", dir)
+	return nil
+}
+
 func fileStorage(dir string) storage.ClientImpl {
 	return storage.NewFileWithCompletion(dir, storage.NewMapPieceCompletion())
 }
@@ -348,7 +385,7 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 
 	a.addPending(magnet, catDir, name) // persist so a restart resumes it
 
-	j := &Job{id: id, name: name, t: t, state: "connecting"}
+	j := &Job{id: id, name: name, magnet: magnet, t: t, state: "connecting"}
 	a.mu.Lock()
 	a.jobs[id] = j
 	a.mu.Unlock()
@@ -516,10 +553,25 @@ func main() {
 	}
 	a.saveConfig() // persist freshly-generated keys / normalize
 
-	// torrent client
+	const uiAddr = "127.0.0.1:47801"
+	uiURL := "http://" + uiAddr
+
+	// single-instance FIRST (before the engine binds any port): a second launch
+	// just opens the panel window and exits, instead of crashing on a busy port.
+	if *selfTest == "" {
+		lock, lerr := net.Listen("tcp", "127.0.0.1:47800")
+		if lerr != nil {
+			openWindow(uiURL)
+			return
+		}
+		defer lock.Close()
+	}
+
+	// torrent client (random listen port avoids fixed-port clashes)
 	tcfg := torrent.NewDefaultClientConfig()
 	tcfg.DataDir = cfg.DownloadDir
 	tcfg.Seed = true // allow seeding; we Drop() per-torrent when KeepSeeding is off
+	tcfg.ListenPort = 0
 	os.MkdirAll(cfg.DownloadDir, 0755)
 	tc, err := torrent.NewClient(tcfg)
 	if err != nil {
@@ -544,17 +596,6 @@ func main() {
 	go a.statusLoop()
 	go a.printLoop()
 
-	const uiAddr = "127.0.0.1:47801"
-	uiURL := "http://" + uiAddr
-
-	// single-instance: if already running, just open the panel and exit
-	lock, lerr := net.Listen("tcp", "127.0.0.1:47800")
-	if lerr != nil {
-		openWindow(uiURL)
-		return
-	}
-	_ = lock // held for process lifetime
-
 	enableAutostart()
 	a.startUI(uiAddr)
 
@@ -568,8 +609,7 @@ func main() {
 	}
 
 	go a.connectLoop(*wsURL)
-	openWindow(uiURL) // show the panel on first launch
-	select {}         // keep running in the background
+	runAgentGUI(a, uiURL) // windows: tray + first window (blocks); other: window + block
 }
 
 // runSelfTest downloads a magnet OR a .torrent URL directly (no relay, no

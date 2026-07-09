@@ -5,12 +5,14 @@ package main
 import (
 	"os"
 	"os/exec"
+	"strings"
 
+	"fyne.io/systray"
 	webview "github.com/webview/webview_go"
 )
 
 // openWindow launches the panel as a native window in a separate process, so
-// the webview event loop never fights the engine for the main thread.
+// the webview event loop never fights the engine/tray for the main thread.
 func openWindow(url string) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -27,4 +29,46 @@ func runWindow(url string) {
 	w.SetSize(600, 780, webview.HintNone)
 	w.Navigate(url)
 	w.Run()
+}
+
+// runAgentGUI runs the tray in the main process (blocks). The panel opens in a
+// child process; closing it leaves the agent running in the tray.
+func runAgentGUI(a *Agent, uiURL string) {
+	onReady := func() {
+		systray.SetIcon(trayIcon)
+		systray.SetTitle("")
+		systray.SetTooltip("Lampa Downloader")
+		mOpen := systray.AddMenuItem("Открыть панель", "")
+		mDir := systray.AddMenuItem("Папка загрузок", "")
+		systray.AddSeparator()
+		mQuit := systray.AddMenuItem("Выход", "")
+
+		openWindow(uiURL) // show panel on first launch
+
+		go func() {
+			for {
+				select {
+				case <-mOpen.ClickedCh:
+					openWindow(uiURL)
+				case <-mDir.ClickedCh:
+					openPath(a.cfg.DownloadDir)
+				case <-mQuit.ClickedCh:
+					systray.Quit()
+				}
+			}
+		}()
+	}
+	systray.Run(onReady, func() { os.Exit(0) })
+}
+
+// pickDir shows the native Windows folder chooser; returns "" if cancelled.
+func pickDir() string {
+	ps := `Add-Type -AssemblyName System.Windows.Forms;` +
+		`$f=New-Object System.Windows.Forms.FolderBrowserDialog;` +
+		`if($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($f.SelectedPath)}`
+	out, err := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

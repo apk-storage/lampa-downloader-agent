@@ -17,6 +17,21 @@ func (a *Agent) startUI(addr string) {
 	mux.HandleFunc("/", a.uiIndex)
 	mux.HandleFunc("/api/state", a.uiState)
 	mux.HandleFunc("/api/opendir", a.uiOpenDir)
+	mux.HandleFunc("/api/cancel", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id != "" {
+			a.cancelJob(id)
+		}
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
+		d := pickDir()
+		if d != "" {
+			a.setDir(d)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
+	})
 	mux.HandleFunc("/api/quit", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")); go osExit() })
 	go http.ListenAndServe(addr, mux)
 }
@@ -114,7 +129,7 @@ button:hover{background:#383838}
 
 <div class="card">
   <div class="label">Папка загрузок</div>
-  <div class="dir"><div class="path" id="dir">—</div><button onclick="openDir()">Открыть</button></div>
+  <div class="dir"><div class="path" id="dir">—</div><button onclick="openDir()">Открыть</button><button onclick="changeDir()">Изменить</button></div>
 </div>
 
 <div class="card">
@@ -126,6 +141,8 @@ button:hover{background:#383838}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
 function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':'скачивание'}
 function openDir(){fetch('/api/opendir')}
+function changeDir(){fetch('/api/pickdir').then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').textContent=d.dir}).catch(function(){})}
+function cancelJob(id){if(confirm('Отменить эту загрузку?')){fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick)}}
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){fetch('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
@@ -138,7 +155,7 @@ function tick(){
     if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
     box.innerHTML=d.jobs.map(function(j){
       var pct=Math.max(0,Math.min(100,j.pct||0));
-      return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+'</div>'+
+      return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+'<button style="float:right;padding:2px 8px;font-size:12px" onclick="cancelJob(\''+esc(j.id)+'\')">✕</button></div>'+
         '<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>'+
         '<div class="meta">'+stateRu(j.state)+' · '+pct+'% · '+(j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ</div></div>';
     }).join('');

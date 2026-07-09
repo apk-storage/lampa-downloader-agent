@@ -19,3 +19,12 @@ func openWindow(url string) {
 
 // runWindow has no native webview off Windows yet; fall back to a browser.
 func runWindow(url string) { openWindow(url) }
+
+// runAgentGUI (non-Windows): open the panel once and keep running headless.
+func runAgentGUI(a *Agent, uiURL string) {
+	openWindow(uiURL)
+	select {}
+}
+
+// pickDir: no native folder dialog off Windows yet.
+func pickDir() string { return "" }
