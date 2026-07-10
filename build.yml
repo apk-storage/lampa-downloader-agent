@@ -11,7 +11,6 @@ permissions:
   packages: write
 
 jobs:
-  # ---- desktop binaries + releases ----
   binaries:
     runs-on: windows-latest
     defaults:
@@ -20,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # нужно для changelog (--generate-notes)
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -32,13 +31,11 @@ jobs:
         id: ver
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            echo "v=$GITHUB_REF_NAME"  >> "$GITHUB_OUTPUT"
-            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "pre=false"            >> "$GITHUB_OUTPUT"
+            echo "v=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true"        >> "$GITHUB_OUTPUT"
           else
             echo "v=nightly-$(date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-            echo "tag=nightly" >> "$GITHUB_OUTPUT"
-            echo "pre=true"    >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build Windows (native webview, CGO)
@@ -57,25 +54,38 @@ jobs:
       - name: Checksums
         run: sha256sum lampa-agent.exe lampa-agent-console.exe lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux > SHA256SUMS.txt
 
-      - name: Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          FILES="lampa-agent.exe lampa-agent-console.exe lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux SHA256SUMS.txt"
-          if [ "${{ steps.ver.outputs.pre }}" = "true" ]; then
-            gh release delete nightly --cleanup-tag --yes || true
-            gh release create nightly --prerelease \
-              --title "Nightly — последняя сборка" \
-              --notes "Автоматическая сборка из main. Для стабильной версии смотрите релизы с тегом vX.Y.Z." \
-              $FILES
-          else
-            gh release create "${{ steps.ver.outputs.tag }}" \
-              --title "${{ steps.ver.outputs.tag }}" \
-              --generate-notes \
-              $FILES
-          fi
+      # Release for version tags (creates or updates, attaches binaries)
+      - name: Release (tag)
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            lampa-agent.exe
+            lampa-agent-console.exe
+            lampa-agent-macos-intel
+            lampa-agent-macos-arm
+            lampa-agent-linux
+            SHA256SUMS.txt
 
-  # ---- Docker image -> GitHub Container Registry ----
+      # Rolling "nightly" prerelease for main pushes
+      - name: Release (nightly)
+        if: steps.ver.outputs.is_tag == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly — последняя сборка
+          prerelease: true
+          body: "Автоматическая сборка из main. Стабильные версии — в релизах с тегом vX.Y.Z."
+          files: |
+            lampa-agent.exe
+            lampa-agent-console.exe
+            lampa-agent-macos-intel
+            lampa-agent-macos-arm
+            lampa-agent-linux
+            SHA256SUMS.txt
+
   docker:
     runs-on: ubuntu-latest
     steps:
