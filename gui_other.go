@@ -28,3 +28,6 @@ func runAgentGUI(a *Agent, uiURL string) {
 
 // pickDir: no native folder dialog off Windows yet.
 func pickDir() string { return "" }
+
+// listDrives: non-Windows has a single root.
+func listDrives() []string { return []string{"/"} }

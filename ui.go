@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -31,6 +33,10 @@ func (a *Agent) startUI(addr string) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
+	})
+	mux.HandleFunc("/api/browse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(browseDir(r.URL.Query().Get("path")))
 	})
 	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
 		d := pickDir()
@@ -95,6 +101,55 @@ func openPath(p string) {
 	_ = cmd.Start()
 }
 
+type dirEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+type browseResp struct {
+	Path   string     `json:"path"`
+	Parent string     `json:"parent"`
+	Up     bool       `json:"up"`
+	Dirs   []dirEntry `json:"dirs"`
+}
+
+// browseDir lists subfolders of a path (or drive roots when path is empty).
+func browseDir(path string) browseResp {
+	var out browseResp
+	if path == "" {
+		for _, d := range listDrives() {
+			name := strings.TrimSuffix(d, string(os.PathSeparator))
+			if name == "" {
+				name = d
+			}
+			out.Dirs = append(out.Dirs, dirEntry{Name: name, Path: d})
+		}
+		return out
+	}
+	out.Path = path
+	out.Up = true
+	parent := filepath.Dir(path)
+	if parent == path {
+		out.Parent = "" // at a drive root -> go back to drive list
+	} else {
+		out.Parent = parent
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasPrefix(n, "$") || strings.HasPrefix(n, ".") {
+			continue
+		}
+		out.Dirs = append(out.Dirs, dirEntry{Name: n, Path: filepath.Join(path, n)})
+	}
+	return out
+}
+
 func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(panelHTML))
@@ -127,6 +182,15 @@ button:hover{background:#383838}
 .fill{height:100%;background:var(--fill);border-radius:4px;transition:width .4s}
 .meta{font-size:12px;color:var(--muted);margin-top:5px}
 .empty{color:var(--muted);font-size:14px;padding:6px 0}
+#browser{display:none;margin-top:12px;border-top:.5px solid var(--line);padding-top:12px}
+.br-top{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.br-path{flex:1;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.br-choose{background:#2b7cff!important;border-color:#2b7cff!important;color:#fff!important}
+#brList{max-height:240px;overflow:auto;border:.5px solid var(--line);border-radius:8px}
+.br-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;border-bottom:.5px solid rgba(255,255,255,.05)}
+.br-item:hover{background:var(--soft)}
+.br-item:last-child{border-bottom:none}
+.br-ic{opacity:.7}
 </style></head><body>
 <div class="top"><span class="dot" id="dot"></span><h1>Lampa Downloader</h1><span class="muted" id="relay" style="margin-left:auto;font-size:13px"></span><button onclick="quit()" style="margin-left:14px">Выход</button></div>
 
@@ -138,7 +202,11 @@ button:hover{background:#383838}
 
 <div class="card">
   <div class="label">Папка загрузок</div>
-  <div class="dir"><input class="path" id="dir" spellcheck="false"><button onclick="saveDir()">Сохранить</button><button onclick="pickDir()">Обзор</button><button onclick="openDir()">Открыть</button></div>
+  <div class="dir"><input class="path" id="dir" spellcheck="false"><button onclick="saveDir()">Сохранить</button><button onclick="brOpen()">Обзор</button><button onclick="openDir()">Открыть</button></div>
+  <div id="browser">
+    <div class="br-top"><button onclick="brUp()" id="brUpBtn">⬆</button><div class="br-path" id="brPath"></div><button class="br-choose" onclick="brChoose()">Выбрать эту папку</button><button onclick="brClose()">✕</button></div>
+    <div id="brList"></div>
+  </div>
 </div>
 
 <div class="card">
@@ -151,7 +219,27 @@ function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;r
 function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':'скачивание'}
 function openDir(){fetch('/api/opendir')}
 function saveDir(){var v=document.getElementById('dir').value;fetch('/api/setdir?dir='+encodeURIComponent(v)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
-function pickDir(){fetch('/api/pickdir').then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
+var brState={path:'',parent:'',up:false},brDirs=[];
+function brOpen(){var cur=document.getElementById('dir').value||'';document.getElementById('browser').style.display='block';brGo(cur)}
+function brClose(){document.getElementById('browser').style.display='none'}
+function brUp(){if(brState.up)brGo(brState.parent)}
+function brChoose(){if(!brState.path)return;fetch('/api/setdir?dir='+encodeURIComponent(brState.path)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir;brClose()}).catch(function(){})}
+function brGo(path){
+  fetch('/api/browse?path='+encodeURIComponent(path||'')).then(r=>r.json()).then(function(d){
+    brState={path:d.path||'',parent:d.parent||'',up:!!d.up};
+    brDirs=d.dirs||[];
+    document.getElementById('brPath').textContent=d.path||'Компьютер';
+    document.getElementById('brUpBtn').style.visibility=d.up?'visible':'hidden';
+    document.querySelector('.br-choose').style.visibility=d.path?'visible':'hidden';
+    var list=document.getElementById('brList');
+    if(!brDirs.length){list.innerHTML='<div class="empty" style="padding:12px">Нет вложенных папок</div>';return}
+    list.innerHTML=brDirs.map(function(x,i){return '<div class="br-item" data-i="'+i+'"><span class="br-ic">📁</span><span>'+esc(x.name)+'</span></div>'}).join('');
+  }).catch(function(){});
+}
+document.getElementById('brList').addEventListener('click',function(e){
+  var el=e.target.closest?e.target.closest('.br-item'):null;
+  if(!el)return;var i=+el.getAttribute('data-i');if(brDirs[i])brGo(brDirs[i].path);
+});
 function cancelJob(id){if(confirm('Отменить эту загрузку?')){fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick)}}
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){fetch('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
