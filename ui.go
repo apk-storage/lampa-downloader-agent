@@ -79,11 +79,12 @@ type uiJobResp struct {
 	TotalMiB int64  `json:"total_mib"`
 }
 type uiStateResp struct {
-	Code  string      `json:"code"`
-	Dir   string      `json:"dir"`
-	Seed  bool        `json:"seed"`
-	Relay bool        `json:"relay"`
-	Jobs  []uiJobResp `json:"jobs"`
+	Code    string      `json:"code"`
+	Dir     string      `json:"dir"`
+	Seed    bool        `json:"seed"`
+	Relay   bool        `json:"relay"`
+	Version string      `json:"version"`
+	Jobs    []uiJobResp `json:"jobs"`
 }
 
 func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
@@ -111,11 +112,12 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(uiStateResp{
-		Code:  fmtCode(a.code),
-		Dir:   a.cfg.DownloadDir,
-		Seed:  a.cfg.KeepSeeding,
-		Relay: up,
-		Jobs:  jobs,
+		Code:    fmtCode(a.code),
+		Dir:     a.cfg.DownloadDir,
+		Seed:    a.cfg.KeepSeeding,
+		Relay:   up,
+		Version: version,
+		Jobs:    jobs,
 	})
 }
 

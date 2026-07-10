@@ -484,11 +484,18 @@ func (a *Agent) statusLoop() {
 
 // ---------- main ----------
 
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	// Native panel window mode: no engine, no re-exec — just the webview.
 	for _, a := range os.Args[1:] {
 		if len(a) > 9 && a[:9] == "--window=" {
 			runWindow(a[9:])
+			return
+		}
+		if a == "--version" || a == "-version" {
+			fmt.Println("Lampa Downloader agent", version)
 			return
 		}
 	}
@@ -585,7 +592,7 @@ func main() {
 	defer tc.Close()
 
 	fmt.Println("============================================")
-	fmt.Printf("  Lampa Downloader agent\n")
+	fmt.Printf("  Lampa Downloader agent %s\n", version)
 	fmt.Printf("  Pairing code:  %s\n", fmtCode(a.code))
 	fmt.Printf("  Download dir:  %s\n", cfg.DownloadDir)
 	fmt.Printf("  Keep seeding:  %v\n", cfg.KeepSeeding)

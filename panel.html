@@ -92,6 +92,7 @@ function tick(){
     var di=document.getElementById('dir');if(document.activeElement!==di)di.value=d.dir||'';
     document.getElementById('dot').className='dot'+(d.relay?' on':'');
     document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';
+    if(d.version)document.getElementById('ver').textContent='Lampa Downloader '+d.version;
     var box=document.getElementById('jobs');
     if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
     box.innerHTML=d.jobs.map(function(j){
@@ -103,4 +104,5 @@ function tick(){
   }).catch(function(){});
 }
 tick();setInterval(tick,1500);
-</script></body></html>
+</script>
+<div id="ver" style="text-align:center;color:var(--muted);font-size:11px;margin-top:18px;opacity:.7"></div></body></html>
