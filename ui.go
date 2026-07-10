@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -69,9 +70,25 @@ func (a *Agent) authWrap(next http.Handler) http.Handler {
 	})
 }
 
+type uiJobResp struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Pct      int64  `json:"pct"`
+	State    string `json:"state"`
+	DoneMiB  int64  `json:"done_mib"`
+	TotalMiB int64  `json:"total_mib"`
+}
+type uiStateResp struct {
+	Code  string      `json:"code"`
+	Dir   string      `json:"dir"`
+	Seed  bool        `json:"seed"`
+	Relay bool        `json:"relay"`
+	Jobs  []uiJobResp `json:"jobs"`
+}
+
 func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
-	jobs := make([]map[string]any, 0, len(a.jobs))
+	jobs := make([]uiJobResp, 0, len(a.jobs))
 	for _, j := range a.jobs {
 		var pct, total, done int64
 		if j.t != nil && j.state != "connecting" {
@@ -84,21 +101,21 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 		if total > 0 {
 			pct = done * 100 / total
 		}
-		jobs = append(jobs, map[string]any{
-			"id": j.id, "name": j.name, "pct": pct, "state": j.state,
-			"done_mib": done / (1 << 20), "total_mib": total / (1 << 20),
+		jobs = append(jobs, uiJobResp{
+			ID: j.id, Name: j.name, Pct: pct, State: j.state,
+			DoneMiB: done / (1 << 20), TotalMiB: total / (1 << 20),
 		})
 	}
 	up := a.relayUp
 	a.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"code":  fmtCode(a.code),
-		"dir":   a.cfg.DownloadDir,
-		"seed":  a.cfg.KeepSeeding,
-		"relay": up,
-		"jobs":  jobs,
+	json.NewEncoder(w).Encode(uiStateResp{
+		Code:  fmtCode(a.code),
+		Dir:   a.cfg.DownloadDir,
+		Seed:  a.cfg.KeepSeeding,
+		Relay: up,
+		Jobs:  jobs,
 	})
 }
 
@@ -174,109 +191,5 @@ func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(panelHTML))
 }
 
-const panelHTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lampa Downloader</title>
-<link rel="icon" href="data:image/png;base64,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">
-<style>
-:root{--bg:#1b1b1b;--card:#242424;--soft:#2e2e2e;--line:#333;--text:#f2f2f2;--muted:#8f8f8f;--ok:#5aa15a;--fill:#e8e8e8}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:28px;max-width:640px;margin:0 auto}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:24px}
-.top h1{font-size:18px;font-weight:600;margin:0}
-.dot{width:9px;height:9px;border-radius:50%;background:#666}
-.dot.on{background:var(--ok)}
-.muted{color:var(--muted)}
-.card{background:var(--card);border:.5px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
-.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
-.code{display:flex;gap:8px}
-.code span{font-family:ui-monospace,Consolas,monospace;font-size:30px;font-weight:600;background:var(--soft);border-radius:8px;padding:6px 14px;letter-spacing:.05em}
-.dir{display:flex;align-items:center;gap:10px;margin-top:6px}
-.dir .path{font-family:ui-monospace,Consolas,monospace;font-size:13px;flex:1;min-width:0;background:var(--soft);color:var(--text);padding:8px 10px;border-radius:8px;border:.5px solid var(--line);outline:none}
-button{background:var(--soft);color:var(--text);border:.5px solid var(--line);border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
-button:hover{background:#383838}
-.dl{margin:14px 0}
-.dl-name{font-size:14px;margin-bottom:6px}
-.bar{height:8px;border-radius:4px;background:var(--soft);overflow:hidden}
-.fill{height:100%;background:var(--fill);border-radius:4px;transition:width .4s}
-.meta{font-size:12px;color:var(--muted);margin-top:5px}
-.empty{color:var(--muted);font-size:14px;padding:6px 0}
-#browser{display:none;margin-top:12px;border-top:.5px solid var(--line);padding-top:12px}
-.br-top{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.br-path{flex:1;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.br-choose{background:#2b7cff!important;border-color:#2b7cff!important;color:#fff!important}
-#brList{max-height:240px;overflow:auto;border:.5px solid var(--line);border-radius:8px}
-.br-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;border-bottom:.5px solid rgba(255,255,255,.05)}
-.br-item:hover{background:var(--soft)}
-.br-item:last-child{border-bottom:none}
-.br-ic{opacity:.7}
-</style></head><body>
-<div class="top"><span class="dot" id="dot"></span><h1>Lampa Downloader</h1><span class="muted" id="relay" style="margin-left:auto;font-size:13px"></span><button onclick="quit()" style="margin-left:14px">Выход</button></div>
-
-<div class="card">
-  <div class="label">Код для Лампы</div>
-  <div class="code" id="code"></div>
-  <div class="muted" style="margin-top:10px;font-size:13px">Введите этот код в Лампе: Настройки → Lampa Downloader → Подключить ПК</div>
-</div>
-
-<div class="card">
-  <div class="label">Папка загрузок</div>
-  <div class="dir"><input class="path" id="dir" spellcheck="false"><button onclick="saveDir()">Сохранить</button><button onclick="brOpen()">Обзор</button><button onclick="openDir()">Открыть</button></div>
-  <div id="browser">
-    <div class="br-top"><button onclick="brUp()" id="brUpBtn">⬆</button><div class="br-path" id="brPath"></div><button class="br-choose" onclick="brChoose()">Выбрать эту папку</button><button onclick="brClose()">✕</button></div>
-    <div id="brList"></div>
-  </div>
-</div>
-
-<div class="card">
-  <div class="label">Загрузки</div>
-  <div id="jobs"><div class="empty">Пока пусто</div></div>
-</div>
-
-<script>
-function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
-function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':'скачивание'}
-function openDir(){fetch('/api/opendir')}
-function saveDir(){var v=document.getElementById('dir').value;fetch('/api/setdir?dir='+encodeURIComponent(v)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
-var brState={path:'',parent:'',up:false},brDirs=[];
-function brOpen(){var cur=document.getElementById('dir').value||'';document.getElementById('browser').style.display='block';brGo(cur)}
-function brClose(){document.getElementById('browser').style.display='none'}
-function brUp(){if(brState.up)brGo(brState.parent)}
-function brChoose(){if(!brState.path)return;fetch('/api/setdir?dir='+encodeURIComponent(brState.path)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir;brClose()}).catch(function(){})}
-function brGo(path){
-  fetch('/api/browse?path='+encodeURIComponent(path||'')).then(r=>r.json()).then(function(d){
-    brState={path:d.path||'',parent:d.parent||'',up:!!d.up};
-    brDirs=d.dirs||[];
-    document.getElementById('brPath').textContent=d.path||'Компьютер';
-    document.getElementById('brUpBtn').style.visibility=d.up?'visible':'hidden';
-    document.querySelector('.br-choose').style.visibility=d.path?'visible':'hidden';
-    var list=document.getElementById('brList');
-    if(!brDirs.length){list.innerHTML='<div class="empty" style="padding:12px">Нет вложенных папок</div>';return}
-    list.innerHTML=brDirs.map(function(x,i){return '<div class="br-item" data-i="'+i+'"><span class="br-ic">📁</span><span>'+esc(x.name)+'</span></div>'}).join('');
-  }).catch(function(){});
-}
-document.getElementById('brList').addEventListener('click',function(e){
-  var el=e.target.closest?e.target.closest('.br-item'):null;
-  if(!el)return;var i=+el.getAttribute('data-i');if(brDirs[i])brGo(brDirs[i].path);
-});
-function cancelJob(id){if(confirm('Отменить эту загрузку?')){fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick)}}
-function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){fetch('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
-function tick(){
-  fetch('/api/state').then(r=>r.json()).then(d=>{
-    var code=document.getElementById('code');code.innerHTML='';
-    (d.code||'').split(' ').join('').split('').forEach(function(c){var s=document.createElement('span');s.textContent=c;code.appendChild(s)});
-    var di=document.getElementById('dir');if(document.activeElement!==di)di.value=d.dir||'';
-    document.getElementById('dot').className='dot'+(d.relay?' on':'');
-    document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';
-    var box=document.getElementById('jobs');
-    if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
-    box.innerHTML=d.jobs.map(function(j){
-      var pct=Math.max(0,Math.min(100,j.pct||0));
-      return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+'<button style="float:right;padding:2px 8px;font-size:12px" onclick="cancelJob(\''+esc(j.id)+'\')">✕</button></div>'+
-        '<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>'+
-        '<div class="meta">'+stateRu(j.state)+' · '+pct+'% · '+(j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ</div></div>';
-    }).join('');
-  }).catch(function(){});
-}
-tick();setInterval(tick,1500);
-</script></body></html>`
+//go:embed panel.html
+var panelHTML string
