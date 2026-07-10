@@ -99,6 +99,7 @@ type Agent struct {
 	jobs    map[string]*Job
 	trusted map[string]bool
 	relayUp bool
+	uiToken string
 
 	outCh chan map[string]any // to current ws writer (best-effort)
 }
@@ -520,6 +521,9 @@ func main() {
 	dirFlag := flag.String("dir", "", "download dir (overrides config)")
 	seedFlag := flag.Bool("seed", false, "keep seeding after complete (overrides config)")
 	selfTest := flag.String("selftest", "", "download this magnet directly (skip relay) and print progress, for testing")
+	uiAddrFlag := flag.String("ui", "127.0.0.1:47801", "web panel bind address (use 0.0.0.0:47801 for NAS/LAN access)")
+	uiToken := flag.String("ui-token", "", "if set, the web panel requires this token (Basic Auth password) — recommended when bound to 0.0.0.0")
+	headless := flag.Bool("headless", false, "no window/tray; run in background (for NAS/servers) — panel via browser")
 	flag.Parse()
 
 	os.MkdirAll(filepath.Dir(*cfgPath), 0700)
@@ -553,8 +557,8 @@ func main() {
 	}
 	a.saveConfig() // persist freshly-generated keys / normalize
 
-	const uiAddr = "127.0.0.1:47801"
-	uiURL := "http://" + uiAddr
+	uiAddr := *uiAddrFlag
+	uiURL := "http://127.0.0.1" + uiAddr[strings.LastIndex(uiAddr, ":"):]
 
 	// single-instance FIRST (before the engine binds any port): a second launch
 	// just opens the panel window and exits, instead of crashing on a busy port.
@@ -597,6 +601,7 @@ func main() {
 	go a.printLoop()
 
 	enableAutostart()
+	a.uiToken = *uiToken
 	a.startUI(uiAddr)
 
 	// resume downloads that were still active when we last exited
@@ -609,6 +614,10 @@ func main() {
 	}
 
 	go a.connectLoop(*wsURL)
+	if *headless {
+		log.Printf("headless mode — panel on http://%s", uiAddr)
+		select {} // NAS/server: run in background, panel via browser
+	}
 	runAgentGUI(a, uiURL) // windows: tray + first window (blocks); other: window + block
 }
 

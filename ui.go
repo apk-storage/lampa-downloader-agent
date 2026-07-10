@@ -47,7 +47,26 @@ func (a *Agent) startUI(addr string) {
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
 	})
 	mux.HandleFunc("/api/quit", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")); go osExit() })
-	go http.ListenAndServe(addr, mux)
+
+	var handler http.Handler = mux
+	if a.uiToken != "" {
+		handler = a.authWrap(mux)
+	}
+	go http.ListenAndServe(addr, handler)
+}
+
+// authWrap requires HTTP Basic Auth (any user, password == token) when a token
+// is configured — used when the panel is exposed on the LAN (NAS).
+func (a *Agent) authWrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pass, ok := r.BasicAuth()
+		if !ok || pass != a.uiToken {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Lampa Downloader"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +177,7 @@ func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 const panelHTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lampa Downloader</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232b7cff'/%3E%3Cpath d='M16 8v10m-5-5 5 5 5-5M10 24h12' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/png;base64,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">
 <style>
 :root{--bg:#1b1b1b;--card:#242424;--soft:#2e2e2e;--line:#333;--text:#f2f2f2;--muted:#8f8f8f;--ok:#5aa15a;--fill:#e8e8e8}
 *{box-sizing:border-box}
