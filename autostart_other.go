@@ -2,5 +2,8 @@
 
 package main
 
-// enableAutostart is a no-op on non-Windows for now (NAS/servers run headless).
-func enableAutostart() {}
+// setAutostart is a no-op off Windows for now (NAS/servers run headless).
+func setAutostart(on bool) error { return nil }
+
+// autostartEnabled always reports false off Windows.
+func autostartEnabled() bool { return false }
