@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -56,6 +57,56 @@ func deriveCode(pub []byte) string {
 	h := sha256.Sum256(pub)
 	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(h[:4])%1000000)
 }
+
+// rotWriter is a tiny size-rotating log file writer (keeps one previous file).
+type rotWriter struct {
+	mu    sync.Mutex
+	path  string
+	f     *os.File
+	size  int64
+	limit int64
+}
+
+func newRotWriter(path string, limit int64) *rotWriter {
+	w := &rotWriter{path: path, limit: limit}
+	w.open()
+	return w
+}
+func (w *rotWriter) open() {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	w.f = f
+	if st, e := f.Stat(); e == nil {
+		w.size = st.Size()
+	}
+}
+func (w *rotWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return len(p), nil
+	}
+	if w.size+int64(len(p)) > w.limit {
+		w.f.Close()
+		os.Rename(w.path, w.path+".1")
+		w.open()
+		w.size = 0
+	}
+	n, err := w.f.Write(p)
+	w.size += int64(n)
+	return n, err
+}
+
+// setupLogging tees log output to the console and a rotating file next to the config.
+func setupLogging(cfgPath string) string {
+	logPath := filepath.Join(filepath.Dir(cfgPath), "agent.log")
+	rw := newRotWriter(logPath, 2<<20) // 2 MiB, +1 rotated
+	log.SetOutput(io.MultiWriter(os.Stderr, rw))
+	return logPath
+}
+
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
 func randID() string {
@@ -100,6 +151,8 @@ type Agent struct {
 	trusted map[string]bool
 	relayUp bool
 	uiToken string
+	logPath string
+	started time.Time
 
 	outCh chan map[string]any // to current ws writer (best-effort)
 }
@@ -113,7 +166,8 @@ func loadOrInitConfig(path string) (Config, error) {
 		}
 		return c, nil
 	}
-	// fresh: generate keypair
+	// fresh: generate keypair and persist it right away, so the pairing code
+	// stays the same across restarts even if we crash before the first save.
 	pub, priv, err := box.GenerateKey(rand.Reader)
 	if err != nil {
 		return c, err
@@ -123,6 +177,21 @@ func loadOrInitConfig(path string) (Config, error) {
 	home, _ := os.UserHomeDir()
 	c.DownloadDir = filepath.Join(home, "Downloads", "Lampa")
 	c.KeepSeeding = false
+
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return c, err
+	}
+	b, err = json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return c, err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return c, fmt.Errorf("config save: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return c, fmt.Errorf("config save: %w", err)
+	}
 	return c, nil
 }
 
@@ -538,6 +607,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	logPath := setupLogging(*cfgPath)
 	if *dirFlag != "" {
 		cfg.DownloadDir = *dirFlag
 	}
@@ -551,6 +621,8 @@ func main() {
 
 	a := &Agent{
 		cfgPath: *cfgPath,
+		logPath: logPath,
+		started: time.Now(),
 		cfg:     cfg,
 		priv:    &priv,
 		pub:     &pub,
