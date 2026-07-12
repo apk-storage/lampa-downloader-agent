@@ -39,6 +39,8 @@ type Config struct {
 	Pub         string       `json:"pub"`          // base64 X25519 public
 	DownloadDir string       `json:"download_dir"` // base folder; categories go under it
 	KeepSeeding bool         `json:"keep_seeding"` // false = stop seeding when complete
+	Autostart   bool         `json:"autostart"`    // launch with the OS
+	DeletePart  bool         `json:"delete_part"`  // remove partial files when a job is cancelled
 	Trusted     []string     `json:"trusted"`      // base64 plugin public keys
 	Pending     []PendingJob `json:"pending"`      // active downloads, re-added on startup
 }
@@ -132,6 +134,7 @@ type Job struct {
 	id     string
 	name   string // kept locally for logs only; never sent to relay
 	magnet string // for pending removal on cancel
+	dir    string // category subfolder, for cleanup on cancel
 	t      *torrent.Torrent
 	state  string // connecting|downloading|paused|seeding|done
 	pct    int
@@ -183,6 +186,8 @@ func loadOrInitConfig(path string) (Config, error) {
 	home, _ := os.UserHomeDir()
 	c.DownloadDir = filepath.Join(home, "Downloads", "Lampa")
 	c.KeepSeeding = false
+	c.Autostart = true // desktop default; can be turned off in the panel
+	c.DeletePart = false
 
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return c, err
@@ -324,6 +329,8 @@ func (a *Agent) handleConn(conn *websocket.Conn) {
 			a.onPaired(str(m["pub"]))
 		case "job":
 			a.onJob(m)
+		case "cmd":
+			a.onCmd(m)
 		}
 	}
 }
@@ -346,6 +353,51 @@ func (a *Agent) onPaired(pubB string) {
 		log.Printf("paired with a new plugin (trusted key added)")
 	} else {
 		log.Printf("re-paired with a known plugin")
+	}
+}
+
+// onCmd handles a control command from a paired plugin (pause/resume/cancel).
+// Same trust + E2E rules as jobs: unknown keys and bad ciphertext are dropped.
+func (a *Agent) onCmd(m map[string]any) {
+	pubB := str(m["pub"])
+	a.mu.Lock()
+	trusted := a.trusted[pubB]
+	a.mu.Unlock()
+	if !trusted {
+		log.Printf("cmd from untrusted key -> dropped")
+		return
+	}
+	var nonce [24]byte
+	nb := unb64(str(m["nonce"]))
+	if len(nb) != 24 {
+		return
+	}
+	copy(nonce[:], nb)
+	var peer [32]byte
+	copy(peer[:], unb64(pubB))
+
+	pt, ok := box.Open(nil, unb64(str(m["ct"])), &nonce, &peer, a.priv)
+	if !ok {
+		log.Printf("cmd decrypt failed -> dropped")
+		return
+	}
+	var payload struct {
+		Act string `json:"act"` // pause|resume|cancel
+		ID  string `json:"id"`  // job id
+	}
+	if err := json.Unmarshal(pt, &payload); err != nil || payload.ID == "" {
+		log.Printf("cmd payload parse failed -> dropped")
+		return
+	}
+	switch payload.Act {
+	case "pause":
+		a.pauseJob(payload.ID)
+	case "resume":
+		a.resumeJob(payload.ID)
+	case "cancel":
+		a.cancelJob(payload.ID)
+	default:
+		log.Printf("cmd %q unknown -> dropped", payload.Act)
 	}
 }
 
@@ -446,7 +498,25 @@ func (a *Agent) cancelJob(id string) {
 		return
 	}
 	if j.t != nil {
-		func() { defer func() { _ = recover() }(); j.t.Drop() }()
+		var files []string
+		func() {
+			defer func() { _ = recover() }()
+			if a.cfg.DeletePart {
+				for _, f := range j.t.Files() {
+					files = append(files, f.Path())
+				}
+			}
+			j.t.Drop()
+		}()
+		if a.cfg.DeletePart {
+			base := filepath.Join(a.cfg.DownloadDir, j.dir)
+			for _, rel := range files {
+				p := filepath.Join(base, rel)
+				os.Remove(p)
+				os.Remove(p + ".part")
+			}
+			log.Printf("job %s: partial files removed", id)
+		}
 	}
 	if j.magnet != "" {
 		a.removePending(j.magnet)
@@ -454,7 +524,9 @@ func (a *Agent) cancelJob(id string) {
 	log.Printf("job %s cancelled: %q", id, j.name)
 }
 
-// setDir changes the download folder for future downloads.
+// setDir changes the download folder for future downloads. The folder must be
+// creatable and writable, so the panel can report a real error instead of
+// silently failing later, mid-download.
 func (a *Agent) setDir(dir string) error {
 	if dir == "" {
 		return fmt.Errorf("empty path")
@@ -462,6 +534,12 @@ func (a *Agent) setDir(dir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	probe := filepath.Join(dir, ".lampa-write-test")
+	if err := os.WriteFile(probe, []byte("ok"), 0644); err != nil {
+		return err
+	}
+	os.Remove(probe)
+
 	a.mu.Lock()
 	a.cfg.DownloadDir = dir
 	a.mu.Unlock()
@@ -495,7 +573,7 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 
 	a.addPending(magnet, catDir, name) // persist so a restart resumes it
 
-	j := &Job{id: id, name: name, magnet: magnet, t: t, state: "connecting"}
+	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, t: t, state: "connecting"}
 	a.mu.Lock()
 	a.jobs[id] = j
 	a.mu.Unlock()
@@ -607,7 +685,27 @@ func (a *Agent) statusLoop() {
 		a.mu.Lock()
 		jobs := make([]map[string]any, 0, len(a.jobs))
 		for _, j := range a.jobs {
-			jobs = append(jobs, map[string]any{"id": j.id, "pct": j.pct, "state": j.state})
+			var total, done int64
+			var peers, seeds int
+			if j.t != nil && j.state != "connecting" {
+				func() {
+					defer func() { _ = recover() }()
+					total = j.t.Length()
+					done = j.t.BytesCompleted()
+					st := j.t.Stats()
+					peers = st.ActivePeers
+					seeds = st.ConnectedSeeders
+				}()
+			}
+			eta := int64(-1)
+			if j.speed > 0 && total > done {
+				eta = (total - done) / j.speed
+			}
+			jobs = append(jobs, map[string]any{
+				"id": j.id, "pct": j.pct, "state": j.state,
+				"speed": j.speed, "eta": eta,
+				"peers": peers, "seeds": seeds, "paused": j.paused,
+			})
 		}
 		a.mu.Unlock()
 		if len(jobs) > 0 {
@@ -744,7 +842,10 @@ func main() {
 	go a.statusLoop()
 	go a.printLoop()
 
-	enableAutostart()
+	// apply the autostart preference from config (default: on for desktop)
+	if err := setAutostart(a.cfg.Autostart); err != nil {
+		log.Printf("autostart: %v", err)
+	}
 	a.uiToken = *uiToken
 	a.startUI(uiAddr)
 

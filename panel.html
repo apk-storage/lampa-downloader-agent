@@ -26,6 +26,12 @@ button:hover{background:#383838}
 .meta{font-size:12px;color:var(--muted);margin-top:5px}
 .empty{color:var(--muted);font-size:14px;padding:6px 0}
 .jb{padding:2px 8px;font-size:12px;margin-left:6px}
+.dirmsg{font-size:12px;margin-top:8px;min-height:16px;opacity:0;transition:opacity .2s}
+.dirmsg.show{opacity:1}
+.dirmsg.ok{color:#5aa15a}
+.dirmsg.err{color:#e05a5a}
+.sw{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:14px;cursor:pointer}
+.sw input{width:16px;height:16px;accent-color:#2b7cff;cursor:pointer}
 #browser{display:none;margin-top:12px;border-top:.5px solid var(--line);padding-top:12px}
 .br-top{display:flex;gap:8px;align-items:center;margin-bottom:8px}
 .br-path{flex:1;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -46,11 +52,19 @@ button:hover{background:#383838}
 
 <div class="card">
   <div class="label">Папка загрузок</div>
-  <div class="dir"><input class="path" id="dir" spellcheck="false"><button onclick="saveDir()">Сохранить</button><button onclick="brOpen()">Обзор</button><button onclick="openDir()">Открыть</button></div>
+  <div class="dir"><input class="path" id="dir" spellcheck="false" placeholder="Путь к папке загрузок"><button onclick="brOpen()">Обзор</button><button onclick="openDir()">Открыть</button></div>
+  <div id="dirmsg" class="dirmsg"></div>
   <div id="browser">
     <div class="br-top"><button onclick="brUp()" id="brUpBtn">⬆</button><div class="br-path" id="brPath"></div><button class="br-choose" onclick="brChoose()">Выбрать эту папку</button><button onclick="brClose()">✕</button></div>
     <div id="brList"></div>
   </div>
+</div>
+
+<div class="card">
+  <div class="label">Настройки</div>
+  <label class="sw"><input type="checkbox" id="st_seed"><span>Раздавать после скачивания</span></label>
+  <label class="sw"><input type="checkbox" id="st_auto"><span>Запускать вместе с системой</span></label>
+  <label class="sw"><input type="checkbox" id="st_part"><span>Удалять недокачанные файлы при отмене</span></label>
 </div>
 
 <div class="card">
@@ -67,12 +81,27 @@ function pauseJob(id){fetch('/api/pause?id='+encodeURIComponent(id)).then(tick)}
 function resumeJob(id){fetch('/api/resume?id='+encodeURIComponent(id)).then(tick)}
 function copyDiag(){fetch('/api/diag').then(r=>r.text()).then(function(t){navigator.clipboard.writeText(t).then(function(){alert('Диагностика скопирована в буфер обмена')},function(){prompt('Скопируйте диагностику:',t)})})}
 function openDir(){fetch('/api/opendir')}
-function saveDir(){var v=document.getElementById('dir').value;fetch('/api/setdir?dir='+encodeURIComponent(v)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
+var dirSaved='';
+function dirMsg(text,ok){
+  var m=document.getElementById('dirmsg');
+  m.textContent=text; m.className='dirmsg show '+(ok?'ok':'err');
+  clearTimeout(m._t); m._t=setTimeout(function(){m.className='dirmsg'},2500);
+}
+function saveDir(){
+  var el=document.getElementById('dir'), v=el.value.trim();
+  if(!v || v===dirSaved) return;
+  fetch('/api/setdir?dir='+encodeURIComponent(v)).then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d}})})
+   .then(function(res){
+      if(res.ok && res.d && res.d.dir){ el.value=res.d.dir; dirSaved=res.d.dir; dirMsg('Папка сохранена',true); }
+      else { dirMsg((res.d&&res.d.error)||'Не удалось сохранить папку',false); }
+   })
+   .catch(function(){ dirMsg('Не удалось сохранить папку',false) });
+}
 var brState={path:'',parent:'',up:false},brDirs=[];
 function brOpen(){var cur=document.getElementById('dir').value||'';document.getElementById('browser').style.display='block';brGo(cur)}
 function brClose(){document.getElementById('browser').style.display='none'}
 function brUp(){if(brState.up)brGo(brState.parent)}
-function brChoose(){if(!brState.path)return;fetch('/api/setdir?dir='+encodeURIComponent(brState.path)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir;brClose()}).catch(function(){})}
+function brChoose(){if(!brState.path)return;fetch('/api/setdir?dir='+encodeURIComponent(brState.path)).then(r=>r.json()).then(function(d){if(d&&d.dir){document.getElementById('dir').value=d.dir;dirSaved=d.dir;dirMsg('Папка сохранена',true);}brClose()}).catch(function(){dirMsg('Не удалось сохранить папку',false);brClose()})}
 function brGo(path){
   fetch('/api/browse?path='+encodeURIComponent(path||'')).then(r=>r.json()).then(function(d){
     brState={path:d.path||'',parent:d.parent||'',up:!!d.up};
@@ -95,7 +124,7 @@ function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
     var code=document.getElementById('code');code.innerHTML='';
     (d.code||'').split(' ').join('').split('').forEach(function(c){var s=document.createElement('span');s.textContent=c;code.appendChild(s)});
-    var di=document.getElementById('dir');if(document.activeElement!==di)di.value=d.dir||'';
+    var di=document.getElementById('dir');if(document.activeElement!==di){di.value=d.dir||'';dirSaved=d.dir||'';}
     document.getElementById('dot').className='dot'+(d.relay?' on':'');
     document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';
     if(d.version)document.getElementById('ver').textContent='Lampa Downloader '+d.version;
@@ -125,6 +154,23 @@ document.getElementById('jobs').addEventListener('click',function(e){
   else if(act==='resume') resumeJob(id);
   else if(act==='cancel' && confirm('Отменить эту загрузку?')) fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick);
 });
+function loadSettings(){
+  fetch('/api/settings').then(r=>r.json()).then(function(s){
+    document.getElementById('st_seed').checked=!!s.keep_seeding;
+    document.getElementById('st_auto').checked=!!s.autostart;
+    document.getElementById('st_part').checked=!!s.delete_part;
+  }).catch(function(){});
+}
+function saveSetting(k,v){fetch('/api/settings?'+k+'='+(v?'1':'0')).catch(function(){})}
+document.getElementById('st_seed').addEventListener('change',function(e){saveSetting('keep_seeding',e.target.checked)});
+document.getElementById('st_auto').addEventListener('change',function(e){saveSetting('autostart',e.target.checked)});
+document.getElementById('st_part').addEventListener('change',function(e){saveSetting('delete_part',e.target.checked)});
+(function(){
+  var el=document.getElementById('dir');
+  el.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); saveDir(); el.blur(); } });
+  el.addEventListener('blur',saveDir);
+})();
+loadSettings();
 tick();setInterval(tick,1500);
 </script>
 <div style="text-align:center;margin-top:18px"><button onclick="copyDiag()" style="font-size:12px">Скопировать диагностику</button><div id="ver" style="color:var(--muted);font-size:11px;margin-top:10px;opacity:.7"></div></div></body></html>

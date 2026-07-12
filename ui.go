@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -42,10 +43,17 @@ func (a *Agent) startUI(addr string) {
 	})
 	mux.HandleFunc("/api/setdir", func(w http.ResponseWriter, r *http.Request) {
 		dir := r.URL.Query().Get("dir")
-		if dir != "" {
-			a.setDir(dir)
-		}
 		w.Header().Set("Content-Type", "application/json")
+		if dir == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Пустой путь"})
+			return
+		}
+		if err := a.setDir(dir); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": dirErrRu(err)})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
 	})
 	mux.HandleFunc("/api/browse", func(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +61,7 @@ func (a *Agent) startUI(addr string) {
 		json.NewEncoder(w).Encode(browseDir(r.URL.Query().Get("path")))
 	})
 	mux.HandleFunc("/api/diag", a.uiDiag)
+	mux.HandleFunc("/api/settings", a.uiSettings)
 	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
 		d := pickDir()
 		if d != "" {
@@ -104,6 +113,68 @@ type uiStateResp struct {
 	Relay   bool        `json:"relay"`
 	Version string      `json:"version"`
 	Jobs    []uiJobResp `json:"jobs"`
+}
+
+type uiSettingsResp struct {
+	KeepSeeding bool `json:"keep_seeding"`
+	Autostart   bool `json:"autostart"`
+	DeletePart  bool `json:"delete_part"`
+}
+
+// uiSettings reads the current preferences, or updates the ones passed as query
+// params (?keep_seeding=1&autostart=0&delete_part=1).
+// dirErrRu turns a filesystem error into a short message for the panel.
+func dirErrRu(err error) string {
+	switch {
+	case os.IsPermission(err):
+		return "Нет прав на эту папку"
+	case os.IsNotExist(err):
+		return "Путь не существует"
+	default:
+		return "Не удалось использовать папку: " + err.Error()
+	}
+}
+
+func (a *Agent) uiSettings(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	changed := false
+
+	if v := q.Get("keep_seeding"); v != "" {
+		a.mu.Lock()
+		a.cfg.KeepSeeding = v == "1"
+		a.mu.Unlock()
+		changed = true
+	}
+	if v := q.Get("delete_part"); v != "" {
+		a.mu.Lock()
+		a.cfg.DeletePart = v == "1"
+		a.mu.Unlock()
+		changed = true
+	}
+	if v := q.Get("autostart"); v != "" {
+		on := v == "1"
+		a.mu.Lock()
+		a.cfg.Autostart = on
+		a.mu.Unlock()
+		if err := setAutostart(on); err != nil {
+			log.Printf("autostart: %v", err)
+		}
+		changed = true
+	}
+	if changed {
+		a.saveConfig()
+	}
+
+	a.mu.Lock()
+	resp := uiSettingsResp{
+		KeepSeeding: a.cfg.KeepSeeding,
+		Autostart:   a.cfg.Autostart,
+		DeletePart:  a.cfg.DeletePart,
+	}
+	a.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (a *Agent) uiDiag(w http.ResponseWriter, r *http.Request) {
