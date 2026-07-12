@@ -35,14 +35,14 @@ import (
 // ---------- config ----------
 
 type Config struct {
-	Priv        string       `json:"priv"`         // base64 X25519 private
-	Pub         string       `json:"pub"`          // base64 X25519 public
-	DownloadDir string       `json:"download_dir"` // base folder; categories go under it
-	KeepSeeding bool         `json:"keep_seeding"` // false = stop seeding when complete
-	Autostart   bool         `json:"autostart"`    // launch with the OS
-	DeletePart  bool         `json:"delete_part"`  // remove partial files when a job is cancelled
-	Trusted     []string     `json:"trusted"`      // base64 plugin public keys
-	Pending     []PendingJob `json:"pending"`      // active downloads, re-added on startup
+	Priv              string       `json:"priv"`                 // base64 X25519 private
+	Pub               string       `json:"pub"`                  // base64 X25519 public
+	DownloadDir       string       `json:"download_dir"`         // base folder; categories go under it
+	KeepSeeding       bool         `json:"keep_seeding"`         // false = stop seeding when complete
+	Autostart         bool         `json:"autostart"`            // launch with the OS
+	KeepFilesOnCancel bool         `json:"keep_files_on_cancel"` // keep partial files when a job is cancelled (default: delete)
+	Trusted           []string     `json:"trusted"`              // base64 plugin public keys
+	Pending           []PendingJob `json:"pending"`              // active downloads, re-added on startup
 }
 
 // PendingJob is persisted so an interrupted download resumes after a restart
@@ -186,8 +186,8 @@ func loadOrInitConfig(path string) (Config, error) {
 	home, _ := os.UserHomeDir()
 	c.DownloadDir = filepath.Join(home, "Downloads", "Lampa")
 	c.KeepSeeding = false
-	c.Autostart = true // desktop default; can be turned off in the panel
-	c.DeletePart = false
+	c.Autostart = true          // desktop default; can be turned off in the panel
+	c.KeepFilesOnCancel = false // cancel cleans up by default
 
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return c, err
@@ -466,6 +466,7 @@ func (a *Agent) pauseJob(id string) {
 	j.state = "paused"
 	j.speed = 0
 	a.mu.Unlock()
+	a.pushStatus()
 	log.Printf("job %s paused: %q", id, j.name)
 }
 
@@ -483,6 +484,7 @@ func (a *Agent) resumeJob(id string) {
 	j.state = "downloading"
 	j.lastAt = time.Time{} // reset speed sampling
 	a.mu.Unlock()
+	a.pushStatus()
 	log.Printf("job %s resumed: %q", id, j.name)
 }
 
@@ -493,35 +495,63 @@ func (a *Agent) cancelJob(id string) {
 	if j != nil {
 		delete(a.jobs, id)
 	}
+	keep := a.cfg.KeepFilesOnCancel
+	base := filepath.Join(a.cfg.DownloadDir, j.dirOrEmpty())
 	a.mu.Unlock()
 	if j == nil {
 		return
 	}
+
+	// Collect file paths BEFORE dropping: after Drop the torrent is gone.
+	var files []string
 	if j.t != nil {
-		var files []string
 		func() {
 			defer func() { _ = recover() }()
-			if a.cfg.DeletePart {
-				for _, f := range j.t.Files() {
-					files = append(files, f.Path())
+			for _, f := range j.t.Files() {
+				files = append(files, f.Path())
+			}
+		}()
+		func() { defer func() { _ = recover() }(); j.t.Drop() }()
+	}
+
+	if !keep {
+		time.Sleep(300 * time.Millisecond) // let the engine release its handles
+		removed := 0
+		for _, rel := range files {
+			p := filepath.Join(base, filepath.FromSlash(rel))
+			for _, cand := range []string{p, p + ".part"} {
+				if err := os.Remove(cand); err == nil {
+					removed++
 				}
 			}
-			j.t.Drop()
-		}()
-		if a.cfg.DeletePart {
-			base := filepath.Join(a.cfg.DownloadDir, j.dir)
-			for _, rel := range files {
-				p := filepath.Join(base, rel)
-				os.Remove(p)
-				os.Remove(p + ".part")
-			}
-			log.Printf("job %s: partial files removed", id)
 		}
+		// Remove now-empty directories left behind by the torrent.
+		for _, rel := range files {
+			d := filepath.Dir(filepath.Join(base, filepath.FromSlash(rel)))
+			for d != base && len(d) > len(base) {
+				if os.Remove(d) != nil {
+					break // not empty (or gone) — stop climbing
+				}
+				d = filepath.Dir(d)
+			}
+		}
+		log.Printf("job %s cancelled: %q (removed %d files)", id, j.name, removed)
+	} else {
+		log.Printf("job %s cancelled: %q (files kept)", id, j.name)
 	}
+
 	if j.magnet != "" {
 		a.removePending(j.magnet)
 	}
-	log.Printf("job %s cancelled: %q", id, j.name)
+	a.pushStatus() // reflect the removal on the TV at once
+}
+
+// dirOrEmpty is nil-safe access to the job's category folder.
+func (j *Job) dirOrEmpty() string {
+	if j == nil {
+		return ""
+	}
+	return j.dir
 }
 
 // setDir changes the download folder for future downloads. The folder must be
@@ -680,6 +710,21 @@ func printJob(j *Job) {
 		j.state, pct, float64(done)/(1<<20), float64(total)/(1<<20), j.name)
 }
 
+// pushStatus sends the current job list to the relay right away, so the plugin
+// sees pause/cancel results immediately instead of waiting for the next tick.
+func (a *Agent) pushStatus() {
+	a.mu.Lock()
+	jobs := make([]map[string]any, 0, len(a.jobs))
+	for _, j := range a.jobs {
+		jobs = append(jobs, map[string]any{
+			"id": j.id, "pct": j.pct, "state": j.state, "paused": j.paused,
+			"speed": j.speed,
+		})
+	}
+	a.mu.Unlock()
+	a.send(map[string]any{"type": "status", "jobs": jobs})
+}
+
 func (a *Agent) statusLoop() {
 	for range time.Tick(2 * time.Second) {
 		a.mu.Lock()
@@ -708,9 +753,7 @@ func (a *Agent) statusLoop() {
 			})
 		}
 		a.mu.Unlock()
-		if len(jobs) > 0 {
-			a.send(map[string]any{"type": "status", "jobs": jobs})
-		}
+		a.send(map[string]any{"type": "status", "jobs": jobs}) // send even when empty: clears finished/cancelled jobs on the TV
 	}
 }
 

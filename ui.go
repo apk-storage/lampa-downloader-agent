@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,28 +21,36 @@ func osExit() { time.Sleep(150 * time.Millisecond); os.Exit(0) }
 func (a *Agent) startUI(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.uiIndex)
+
+	// --- read-only (GET) ---
 	mux.HandleFunc("/api/state", a.uiState)
-	mux.HandleFunc("/api/opendir", a.uiOpenDir)
-	mux.HandleFunc("/api/cancel", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		if id != "" {
+	mux.HandleFunc("/api/diag", a.uiDiag)
+	mux.HandleFunc("/api/browse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(browseDir(r.URL.Query().Get("path")))
+	})
+
+	// --- mutating (POST only, same-origin) ---
+	mux.HandleFunc("/api/opendir", a.mutate(a.uiOpenDir))
+	mux.HandleFunc("/api/cancel", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		if id := r.URL.Query().Get("id"); id != "" {
 			a.cancelJob(id)
 		}
 		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/api/pause", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/pause", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		if id := r.URL.Query().Get("id"); id != "" {
 			a.pauseJob(id)
 		}
 		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/api/resume", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/resume", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		if id := r.URL.Query().Get("id"); id != "" {
 			a.resumeJob(id)
 		}
 		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/api/setdir", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/setdir", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		dir := r.URL.Query().Get("dir")
 		w.Header().Set("Content-Type", "application/json")
 		if dir == "" {
@@ -55,28 +64,63 @@ func (a *Agent) startUI(addr string) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
-	})
-	mux.HandleFunc("/api/browse", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(browseDir(r.URL.Query().Get("path")))
-	})
-	mux.HandleFunc("/api/diag", a.uiDiag)
-	mux.HandleFunc("/api/settings", a.uiSettings)
-	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/settings", a.mutate(a.uiSettings))
+	mux.HandleFunc("/api/pickdir", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		d := pickDir()
 		if d != "" {
 			a.setDir(d)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
-	})
-	mux.HandleFunc("/api/quit", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")); go osExit() })
+	}))
+	mux.HandleFunc("/api/quit", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+		go osExit()
+	}))
 
 	var handler http.Handler = mux
 	if a.uiToken != "" {
 		handler = a.authWrap(mux)
 	}
 	go http.ListenAndServe(addr, handler)
+}
+
+// mutate wraps a state-changing endpoint: it must be POST and same-origin.
+// This blocks CSRF — a random website can't POST here, and can't use a GET
+// <img>/<script> to trigger it either (quit, cancel, setdir, etc).
+func (a *Agent) mutate(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !localOrigin(r) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// localOrigin allows requests from the panel itself (loopback) and rejects
+// cross-site ones. GET reads are unaffected; only mutations go through here.
+func localOrigin(r *http.Request) bool {
+	o := r.Header.Get("Origin")
+	if o == "" {
+		o = r.Header.Get("Referer")
+	}
+	if o == "" {
+		// No Origin/Referer: same-origin fetch or a native (non-browser) client.
+		return true
+	}
+	u, err := url.Parse(o)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 // authWrap requires HTTP Basic Auth (any user, password == token) when a token
@@ -118,7 +162,7 @@ type uiStateResp struct {
 type uiSettingsResp struct {
 	KeepSeeding bool `json:"keep_seeding"`
 	Autostart   bool `json:"autostart"`
-	DeletePart  bool `json:"delete_part"`
+	KeepFiles   bool `json:"keep_files"`
 }
 
 // uiSettings reads the current preferences, or updates the ones passed as query
@@ -145,9 +189,9 @@ func (a *Agent) uiSettings(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 		changed = true
 	}
-	if v := q.Get("delete_part"); v != "" {
+	if v := q.Get("keep_files"); v != "" {
 		a.mu.Lock()
-		a.cfg.DeletePart = v == "1"
+		a.cfg.KeepFilesOnCancel = v == "1"
 		a.mu.Unlock()
 		changed = true
 	}
@@ -169,7 +213,7 @@ func (a *Agent) uiSettings(w http.ResponseWriter, r *http.Request) {
 	resp := uiSettingsResp{
 		KeepSeeding: a.cfg.KeepSeeding,
 		Autostart:   a.cfg.Autostart,
-		DeletePart:  a.cfg.DeletePart,
+		KeepFiles:   a.cfg.KeepFilesOnCancel,
 	}
 	a.mu.Unlock()
 
