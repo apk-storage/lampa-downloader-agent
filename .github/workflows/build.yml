@@ -1,13 +1,22 @@
 name: build-agent
 
 on:
+  # Публикация релиза -> собрать и приложить бинари к этому релизу
   release:
     types: [published]
+  # Обычная заливка в main -> просто собрать бинари в артефакты (без релизов)
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'panel.html'
+      - 'go.mod'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Тег существующего релиза, например v1.0.0'
-        required: true
+        description: 'Тег существующего релиза, например v1.0.5'
+        required: false
         type: string
 
 permissions:
@@ -22,17 +31,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.sha }}
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: 'stable'
+          cache: false
 
       - run: go mod tidy
 
       - name: Version
         id: ver
-        run: echo "v=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -n "$TAG" ]; then
+            echo "v=$TAG"        >> "$GITHUB_OUTPUT"
+            echo "release=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "v=dev-$(date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build Windows (native webview, CGO)
         env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '1' }
@@ -50,10 +68,27 @@ jobs:
       - name: Checksums
         run: sha256sum lampa-agent.exe lampa-agent-console.exe lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux > SHA256SUMS.txt
 
+      # Тестовые сборки из main: качаются со страницы Actions, релизы не трогаются
+      - name: Upload artifacts
+        if: steps.ver.outputs.release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lampa-agent-${{ steps.ver.outputs.v }}
+          retention-days: 14
+          path: |
+            lampa-agent.exe
+            lampa-agent-console.exe
+            lampa-agent-macos-intel
+            lampa-agent-macos-arm
+            lampa-agent-linux
+            SHA256SUMS.txt
+
+      # Публикация релиза: доложить бинари в этот релиз
       - name: Upload binaries to release
+        if: steps.ver.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          RELEASE_TAG: ${{ steps.ver.outputs.v }}
         run: |
           gh release upload "$RELEASE_TAG" \
             lampa-agent.exe \
