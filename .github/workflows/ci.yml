@@ -14,8 +14,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
-          cache: false
+          go-version: 'stable'   # свежий патч Go: закрывает CVE в crypto/x509, tls, textproto
+          cache: false           # go.sum в репо нет — кэш всё равно не работает
 
       - run: go mod tidy
 
