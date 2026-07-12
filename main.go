@@ -133,8 +133,14 @@ type Job struct {
 	name   string // kept locally for logs only; never sent to relay
 	magnet string // for pending removal on cancel
 	t      *torrent.Torrent
-	state  string // connecting|downloading|seeding|done
+	state  string // connecting|downloading|paused|seeding|done
 	pct    int
+	paused bool
+
+	// speed sampling
+	lastBytes int64
+	lastAt    time.Time
+	speed     int64 // bytes/sec, smoothed
 }
 
 type Agent struct {
@@ -394,6 +400,40 @@ func (a *Agent) onJob(m map[string]any) {
 // Windows ("CreateFileMapping ... externally altered"). Part files keep
 // partial data on disk, so an interrupted job resumes after a restart
 // (re-hashes what's there, continues from disk).
+// pauseJob stops requesting data but keeps the torrent (and its files) around.
+func (a *Agent) pauseJob(id string) {
+	a.mu.Lock()
+	j := a.jobs[id]
+	a.mu.Unlock()
+	if j == nil || j.t == nil || j.paused {
+		return
+	}
+	func() { defer func() { _ = recover() }(); j.t.DisallowDataDownload() }()
+	a.mu.Lock()
+	j.paused = true
+	j.state = "paused"
+	j.speed = 0
+	a.mu.Unlock()
+	log.Printf("job %s paused: %q", id, j.name)
+}
+
+// resumeJob re-enables downloading for a paused job.
+func (a *Agent) resumeJob(id string) {
+	a.mu.Lock()
+	j := a.jobs[id]
+	a.mu.Unlock()
+	if j == nil || j.t == nil || !j.paused {
+		return
+	}
+	func() { defer func() { _ = recover() }(); j.t.AllowDataDownload() }()
+	a.mu.Lock()
+	j.paused = false
+	j.state = "downloading"
+	j.lastAt = time.Time{} // reset speed sampling
+	a.mu.Unlock()
+	log.Printf("job %s resumed: %q", id, j.name)
+}
+
 // cancelJob stops a download, removes it, and forgets it so it won't resume.
 func (a *Agent) cancelJob(id string) {
 	a.mu.Lock()
@@ -472,14 +512,39 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 		if total > 0 {
 			pct = int(done * 100 / total)
 		}
+		now := time.Now()
+
 		a.mu.Lock()
 		j.pct = pct
+		// speed: exponentially smoothed bytes/sec between samples
+		if !j.lastAt.IsZero() && !j.paused {
+			if dt := now.Sub(j.lastAt).Seconds(); dt > 0 {
+				inst := int64(float64(done-j.lastBytes) / dt)
+				if inst < 0 {
+					inst = 0
+				}
+				if j.speed == 0 {
+					j.speed = inst
+				} else {
+					j.speed = (j.speed*2 + inst) / 3 // smooth out spikes
+				}
+			}
+		}
+		j.lastBytes, j.lastAt = done, now
+		if !j.paused && j.state == "connecting" {
+			j.state = "downloading"
+		}
 		a.mu.Unlock()
+
 		if done >= total && total > 0 {
 			break
 		}
 		time.Sleep(1 * time.Second)
 	}
+
+	a.mu.Lock()
+	j.speed = 0
+	a.mu.Unlock()
 
 	a.removePending(magnet) // done downloading; no longer needs resume
 	if a.cfg.KeepSeeding {

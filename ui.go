@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +28,18 @@ func (a *Agent) startUI(addr string) {
 		}
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/api/pause", func(w http.ResponseWriter, r *http.Request) {
+		if id := r.URL.Query().Get("id"); id != "" {
+			a.pauseJob(id)
+		}
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/api/resume", func(w http.ResponseWriter, r *http.Request) {
+		if id := r.URL.Query().Get("id"); id != "" {
+			a.resumeJob(id)
+		}
+		w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/api/setdir", func(w http.ResponseWriter, r *http.Request) {
 		dir := r.URL.Query().Get("dir")
 		if dir != "" {
@@ -39,6 +52,7 @@ func (a *Agent) startUI(addr string) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(browseDir(r.URL.Query().Get("path")))
 	})
+	mux.HandleFunc("/api/diag", a.uiDiag)
 	mux.HandleFunc("/api/pickdir", func(w http.ResponseWriter, r *http.Request) {
 		d := pickDir()
 		if d != "" {
@@ -77,6 +91,11 @@ type uiJobResp struct {
 	State    string `json:"state"`
 	DoneMiB  int64  `json:"done_mib"`
 	TotalMiB int64  `json:"total_mib"`
+	Speed    int64  `json:"speed"` // bytes/sec
+	ETA      int64  `json:"eta"`   // seconds, -1 = unknown
+	Peers    int    `json:"peers"`
+	Seeds    int    `json:"seeds"`
+	Paused   bool   `json:"paused"`
 }
 type uiStateResp struct {
 	Code    string      `json:"code"`
@@ -87,24 +106,62 @@ type uiStateResp struct {
 	Jobs    []uiJobResp `json:"jobs"`
 }
 
+func (a *Agent) uiDiag(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	relay := a.relayUp
+	njobs := len(a.jobs)
+	jobLines := make([]string, 0, njobs)
+	for _, j := range a.jobs {
+		jobLines = append(jobLines, fmt.Sprintf("  - %s | %d%% | %s", j.name, j.pct, j.state))
+	}
+	a.mu.Unlock()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Lampa Downloader — диагностика\n")
+	fmt.Fprintf(&b, "версия:      %s\n", version)
+	fmt.Fprintf(&b, "ОС:          %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(&b, "аптайм:      %s\n", time.Since(a.started).Round(time.Second))
+	fmt.Fprintf(&b, "relay:       %v\n", relay)
+	fmt.Fprintf(&b, "код:         %s\n", fmtCode(a.code))
+	fmt.Fprintf(&b, "папка:       %s\n", a.cfg.DownloadDir)
+	fmt.Fprintf(&b, "сидирование: %v\n", a.cfg.KeepSeeding)
+	fmt.Fprintf(&b, "приёмников:  %d\n", len(a.cfg.Trusted))
+	fmt.Fprintf(&b, "лог-файл:    %s\n", a.logPath)
+	fmt.Fprintf(&b, "задач:       %d\n", njobs)
+	for _, l := range jobLines {
+		b.WriteString(l + "\n")
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(b.String()))
+}
+
 func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	jobs := make([]uiJobResp, 0, len(a.jobs))
 	for _, j := range a.jobs {
 		var pct, total, done int64
+		var peers, seeds int
 		if j.t != nil && j.state != "connecting" {
 			func() {
 				defer func() { _ = recover() }()
 				total = j.t.Length()
 				done = j.t.BytesCompleted()
+				st := j.t.Stats()
+				peers = st.ActivePeers
+				seeds = st.ConnectedSeeders
 			}()
 		}
 		if total > 0 {
 			pct = done * 100 / total
 		}
+		eta := int64(-1)
+		if j.speed > 0 && total > done {
+			eta = (total - done) / j.speed
+		}
 		jobs = append(jobs, uiJobResp{
 			ID: j.id, Name: j.name, Pct: pct, State: j.state,
 			DoneMiB: done / (1 << 20), TotalMiB: total / (1 << 20),
+			Speed: j.speed, ETA: eta, Peers: peers, Seeds: seeds, Paused: j.paused,
 		})
 	}
 	up := a.relayUp

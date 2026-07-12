@@ -25,6 +25,7 @@ button:hover{background:#383838}
 .fill{height:100%;background:var(--fill);border-radius:4px;transition:width .4s}
 .meta{font-size:12px;color:var(--muted);margin-top:5px}
 .empty{color:var(--muted);font-size:14px;padding:6px 0}
+.jb{padding:2px 8px;font-size:12px;margin-left:6px}
 #browser{display:none;margin-top:12px;border-top:.5px solid var(--line);padding-top:12px}
 .br-top{display:flex;gap:8px;align-items:center;margin-bottom:8px}
 .br-path{flex:1;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -59,7 +60,12 @@ button:hover{background:#383838}
 
 <script>
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
-function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':'скачивание'}
+function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':s==='paused'?'пауза':'скачивание'}
+function fmtSpeed(b){if(!b)return '';if(b>1048576)return (b/1048576).toFixed(1)+' МБ/с';if(b>1024)return Math.round(b/1024)+' КБ/с';return b+' Б/с'}
+function fmtEta(s){if(s==null||s<0)return '';if(s<60)return s+' сек';if(s<3600)return Math.round(s/60)+' мин';var h=Math.floor(s/3600),m=Math.round((s%3600)/60);return h+' ч '+m+' мин'}
+function pauseJob(id){fetch('/api/pause?id='+encodeURIComponent(id)).then(tick)}
+function resumeJob(id){fetch('/api/resume?id='+encodeURIComponent(id)).then(tick)}
+function copyDiag(){fetch('/api/diag').then(r=>r.text()).then(function(t){navigator.clipboard.writeText(t).then(function(){alert('Диагностика скопирована в буфер обмена')},function(){prompt('Скопируйте диагностику:',t)})})}
 function openDir(){fetch('/api/opendir')}
 function saveDir(){var v=document.getElementById('dir').value;fetch('/api/setdir?dir='+encodeURIComponent(v)).then(r=>r.json()).then(d=>{if(d&&d.dir)document.getElementById('dir').value=d.dir}).catch(function(){})}
 var brState={path:'',parent:'',up:false},brDirs=[];
@@ -97,12 +103,28 @@ function tick(){
     if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
     box.innerHTML=d.jobs.map(function(j){
       var pct=Math.max(0,Math.min(100,j.pct||0));
-      return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+'<button style="float:right;padding:2px 8px;font-size:12px" onclick="cancelJob(\''+esc(j.id)+'\')">✕</button></div>'+
+      var bits=[stateRu(j.state), pct+'%', (j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ'];
+      var sp=fmtSpeed(j.speed); if(sp) bits.push(sp);
+      var eta=fmtEta(j.eta); if(eta && !j.paused) bits.push('осталось '+eta);
+      if(j.peers||j.seeds) bits.push('пиры '+(j.peers||0)+' · сиды '+(j.seeds||0));
+      var pb=j.paused
+        ? '<button class="jb" data-act="resume" data-id="'+esc(j.id)+'">▶</button>'
+        : '<button class="jb" data-act="pause"  data-id="'+esc(j.id)+'">❚❚</button>';
+      var done=(j.state==='done'||j.state==='seeding');
+      return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+
+        '<span style="float:right">'+(done?'':pb)+'<button class="jb" data-act="cancel" data-id="'+esc(j.id)+'">✕</button></span></div>'+
         '<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>'+
-        '<div class="meta">'+stateRu(j.state)+' · '+pct+'% · '+(j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ</div></div>';
+        '<div class="meta">'+bits.join(' · ')+'</div></div>';
     }).join('');
   }).catch(function(){});
 }
+document.getElementById('jobs').addEventListener('click',function(e){
+  var b=e.target.closest&&e.target.closest('button.jb'); if(!b)return;
+  var id=b.getAttribute('data-id'), act=b.getAttribute('data-act');
+  if(act==='pause')  pauseJob(id);
+  else if(act==='resume') resumeJob(id);
+  else if(act==='cancel' && confirm('Отменить эту загрузку?')) fetch('/api/cancel?id='+encodeURIComponent(id)).then(tick);
+});
 tick();setInterval(tick,1500);
 </script>
-<div id="ver" style="text-align:center;color:var(--muted);font-size:11px;margin-top:18px;opacity:.7"></div></body></html>
+<div style="text-align:center;margin-top:18px"><button onclick="copyDiag()" style="font-size:12px">Скопировать диагностику</button><div id="ver" style="color:var(--muted);font-size:11px;margin-top:10px;opacity:.7"></div></div></body></html>
