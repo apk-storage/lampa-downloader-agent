@@ -518,17 +518,24 @@ func (a *Agent) cancelJob(id string) {
 		time.Sleep(300 * time.Millisecond) // let the engine release its handles
 		removed := 0
 		for _, rel := range files {
-			p := filepath.Join(base, filepath.FromSlash(rel))
-			for _, cand := range []string{p, p + ".part"} {
-				if err := os.Remove(cand); err == nil {
-					removed++
+			rel = filepath.FromSlash(rel)
+			// Try both layouts: <base>/<rel> and <base>/<basename(rel)>.
+			cands := []string{
+				filepath.Join(base, rel),
+				filepath.Join(base, filepath.Base(rel)),
+			}
+			for _, p := range cands {
+				for _, cand := range []string{p, p + ".part"} {
+					if err := os.Remove(cand); err == nil {
+						removed++
+					}
 				}
 			}
 		}
 		// Remove now-empty directories left behind by the torrent.
 		for _, rel := range files {
 			d := filepath.Dir(filepath.Join(base, filepath.FromSlash(rel)))
-			for d != base && len(d) > len(base) {
+			for len(d) > len(base) {
 				if os.Remove(d) != nil {
 					break // not empty (or gone) — stop climbing
 				}
