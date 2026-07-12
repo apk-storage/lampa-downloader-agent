@@ -1,12 +1,14 @@
 name: build-agent
 
 on:
-  push:
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - '.github/workflows/build.yml'
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег существующего релиза, например v1.0.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,44 +21,45 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
 
-      - name: Resolve dependencies
-        run: go mod tidy
+      - run: go mod tidy
+
+      - name: Version
+        id: ver
+        run: echo "v=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Build Windows (native webview, CGO)
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: '1'
+        env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '1' }
         run: |
-          go build -ldflags "-H=windowsgui" -o lampa-agent.exe .
-          go build -o lampa-agent-console.exe .
+          go build -ldflags "-H=windowsgui -X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent.exe .
+          go build -ldflags "-X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent-console.exe .
 
       - name: Build macOS + Linux (cross, no CGO)
+        env: { LDF: "-X main.version=${{ steps.ver.outputs.v }}" }
         run: |
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o lampa-agent-macos-intel .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o lampa-agent-macos-arm .
-          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o lampa-agent-linux .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDF" -o lampa-agent-macos-intel .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDF" -o lampa-agent-macos-arm .
+          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -ldflags "$LDF" -o lampa-agent-linux .
 
-      - name: Publish "latest" release
+      - name: Checksums
+        run: sha256sum lampa-agent.exe lampa-agent-console.exe lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux > SHA256SUMS.txt
+
+      - name: Upload binaries to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          gh release delete latest --cleanup-tag --yes || true
-          gh release create latest \
-            --title "Lampa Downloader agent" \
-            --notes "Автосборка. Windows: lampa-agent.exe (фоновый, нативное окно) или lampa-agent-console.exe (с логами)." \
-            lampa-agent.exe lampa-agent-console.exe \
-            lampa-agent-macos-intel lampa-agent-macos-arm lampa-agent-linux
-
-      - name: Upload artifacts (fallback)
-        uses: actions/upload-artifact@v4
-        with:
-          name: lampa-agent-exe
-          path: |
-            lampa-agent.exe
-            lampa-agent-console.exe
+          gh release upload "$RELEASE_TAG" \
+            lampa-agent.exe \
+            lampa-agent-console.exe \
+            lampa-agent-macos-intel \
+            lampa-agent-macos-arm \
+            lampa-agent-linux \
+            SHA256SUMS.txt \
+            --clobber
