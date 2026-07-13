@@ -180,6 +180,125 @@ func TestLogRotation(t *testing.T) {
 	}
 }
 
+// A corrupt config must never brick the agent: it gets backed up next to the
+// original and a fresh one is generated.
+func TestConfigBrokenBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(path, []byte("{ this is not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadOrInitConfig(path)
+	if err != nil {
+		t.Fatalf("broken config must re-init, not fail: %v", err)
+	}
+	if cfg.Priv == "" || cfg.Pub == "" {
+		t.Fatal("re-initialized config must contain fresh keys")
+	}
+	ents, _ := os.ReadDir(dir)
+	found := false
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "agent.json.broken-") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("broken config was not backed up")
+	}
+}
+
+// Valid JSON with corrupt keys is a broken identity — same treatment.
+func TestConfigBadKeysBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.json")
+	os.WriteFile(path, []byte(`{"priv":"short","pub":"short"}`), 0600)
+
+	cfg, err := loadOrInitConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unb64(cfg.Priv)) != 32 || len(unb64(cfg.Pub)) != 32 {
+		t.Fatal("keys must be regenerated when corrupt")
+	}
+}
+
+// Legacy "trusted" keys (<= v1.0.6) must migrate into named Devices.
+func TestConfigMigratesLegacyTrusted(t *testing.T) {
+	pub, _, _ := box.GenerateKey(cryptoRand{})
+	plug, _, _ := box.GenerateKey(cryptoRand{})
+	c := Config{Priv: b64(pub[:]), Pub: b64(pub[:]), Trusted: []string{b64(plug[:])}}
+	normalizeConfig(&c)
+	if len(c.Devices) != 1 {
+		t.Fatalf("want 1 migrated device, got %d", len(c.Devices))
+	}
+	if c.Devices[0].Pub != b64(plug[:]) || c.Devices[0].Name == "" {
+		t.Fatalf("bad migrated device: %+v", c.Devices[0])
+	}
+	if c.Trusted != nil {
+		t.Fatal("legacy trusted list must be cleared after migration")
+	}
+	// second pass must not duplicate
+	c.Trusted = []string{b64(plug[:])}
+	normalizeConfig(&c)
+	if len(c.Devices) != 1 {
+		t.Fatalf("migration duplicated a device: %d", len(c.Devices))
+	}
+}
+
+func TestInfoHash(t *testing.T) {
+	hexA := "magnet:?xt=urn:btih:0123456789ABCDEF0123456789abcdef01234567&dn=Film"
+	hexB := "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=udp://x"
+	if infoHash(hexA) != infoHash(hexB) || infoHash(hexA) == "" {
+		t.Fatal("same torrent with different trackers/case must match")
+	}
+	if infoHash("not a magnet") != "" {
+		t.Fatal("no infohash must return empty string")
+	}
+	b32 := "magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U"
+	if infoHash(b32) == "" {
+		t.Fatal("base32 infohash must be recognized")
+	}
+}
+
+func TestHistoryCap(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	for i := 0; i < historyCap+10; i++ {
+		a.addHistory(HistEntry{Name: "x", MiB: int64(i)})
+	}
+	if len(a.cfg.History) != historyCap {
+		t.Fatalf("history not capped: %d", len(a.cfg.History))
+	}
+	if a.cfg.History[len(a.cfg.History)-1].MiB != int64(historyCap+9) {
+		t.Fatal("cap must drop the oldest entries, not the newest")
+	}
+}
+
+func TestRenameRevokeDevice(t *testing.T) {
+	dir := t.TempDir()
+	plug, _, _ := box.GenerateKey(cryptoRand{})
+	pubB := b64(plug[:])
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	a.onPaired(pubB)
+	if len(a.devices) != 1 {
+		t.Fatal("pairing did not add a device")
+	}
+	if err := a.renameDevice(pubB, "Гостиная"); err != nil {
+		t.Fatal(err)
+	}
+	if a.devices[pubB].Name != "Гостиная" {
+		t.Fatal("rename did not stick")
+	}
+	if err := a.renameDevice(pubB, strings.Repeat("я", 41)); err == nil {
+		t.Fatal("41-rune name must be rejected")
+	}
+	a.revokeDevice(pubB)
+	if len(a.devices) != 0 {
+		t.Fatal("revoke did not remove the device")
+	}
+}
+
 // cryptoRand adapts crypto/rand for box.GenerateKey in tests.
 type cryptoRand struct{}
 

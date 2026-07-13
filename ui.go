@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -73,6 +74,32 @@ func (a *Agent) startUI(addr string) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"dir": a.cfg.DownloadDir})
+	}))
+	mux.HandleFunc("/api/device/rename", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := a.renameDevice(r.URL.Query().Get("pub"), r.URL.Query().Get("name")); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
+	}))
+	mux.HandleFunc("/api/device/revoke", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		a.revokeDevice(r.URL.Query().Get("pub"))
+		w.Write([]byte("ok"))
+	}))
+	mux.HandleFunc("/api/resetkey", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := a.resetKeys(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
+	}))
+	mux.HandleFunc("/api/history/clear", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		a.clearHistory()
+		w.Write([]byte("ok"))
 	}))
 	mux.HandleFunc("/api/quit", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -151,6 +178,12 @@ type uiJobResp struct {
 	Paused   bool   `json:"paused"`
 	Err      string `json:"err,omitempty"`
 }
+type uiDevResp struct {
+	Pub      string `json:"pub"`
+	Name     string `json:"name"`
+	AddedAt  int64  `json:"added_at"`
+	LastSeen int64  `json:"last_seen"`
+}
 type uiStateResp struct {
 	Code    string      `json:"code"`
 	Dir     string      `json:"dir"`
@@ -158,6 +191,8 @@ type uiStateResp struct {
 	Relay   bool        `json:"relay"`
 	Version string      `json:"version"`
 	Jobs    []uiJobResp `json:"jobs"`
+	Devices []uiDevResp `json:"devices"`
+	History []HistEntry `json:"history"`
 }
 
 type uiSettingsResp struct {
@@ -226,6 +261,7 @@ func (a *Agent) uiDiag(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	relay := a.relayUp
 	njobs := len(a.jobs)
+	ndev := len(a.devices)
 	jobLines := make([]string, 0, njobs)
 	for _, j := range a.jobs {
 		jobLines = append(jobLines, fmt.Sprintf("  - %s | %d%% | %s", j.name, j.pct, j.state))
@@ -241,7 +277,7 @@ func (a *Agent) uiDiag(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "код:         %s\n", fmtCode(a.code))
 	fmt.Fprintf(&b, "папка:       %s\n", a.cfg.DownloadDir)
 	fmt.Fprintf(&b, "сидирование: %v\n", a.cfg.KeepSeeding)
-	fmt.Fprintf(&b, "приёмников:  %d\n", len(a.cfg.Trusted))
+	fmt.Fprintf(&b, "приёмников:  %d\n", ndev)
 	fmt.Fprintf(&b, "лог-файл:    %s\n", a.logPath)
 	fmt.Fprintf(&b, "задач:       %d\n", njobs)
 	for _, l := range jobLines {
@@ -281,17 +317,36 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 			Err: j.err,
 		})
 	}
+	devs := make([]uiDevResp, 0, len(a.devices))
+	for _, d := range a.devices {
+		devs = append(devs, uiDevResp{Pub: d.Pub, Name: d.Name, AddedAt: d.AddedAt, LastSeen: d.LastSeen})
+	}
+	sort.Slice(devs, func(i, j int) bool {
+		if devs[i].AddedAt != devs[j].AddedAt {
+			return devs[i].AddedAt < devs[j].AddedAt
+		}
+		return devs[i].Pub < devs[j].Pub
+	})
+	hist := make([]HistEntry, len(a.cfg.History))
+	copy(hist, a.cfg.History)
+	// newest first for the panel
+	for l, r := 0, len(hist)-1; l < r; l, r = l+1, r-1 {
+		hist[l], hist[r] = hist[r], hist[l]
+	}
+	code, dir, seed := fmtCode(a.code), a.cfg.DownloadDir, a.cfg.KeepSeeding
 	up := a.relayUp
 	a.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(uiStateResp{
-		Code:    fmtCode(a.code),
-		Dir:     a.cfg.DownloadDir,
-		Seed:    a.cfg.KeepSeeding,
+		Code:    code,
+		Dir:     dir,
+		Seed:    seed,
 		Relay:   up,
 		Version: version,
 		Jobs:    jobs,
+		Devices: devs,
+		History: hist,
 	})
 }
 

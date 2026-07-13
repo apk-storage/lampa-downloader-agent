@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,9 +42,30 @@ type Config struct {
 	KeepSeeding       bool         `json:"keep_seeding"`         // false = stop seeding when complete
 	Autostart         bool         `json:"autostart"`            // launch with the OS
 	KeepFilesOnCancel bool         `json:"keep_files_on_cancel"` // keep partial files when a job is cancelled (default: delete)
-	Trusted           []string     `json:"trusted"`              // base64 plugin public keys
+	Trusted           []string     `json:"trusted,omitempty"`    // LEGACY (<= v1.0.6): bare plugin keys; migrated to Devices on load
+	Devices           []Device     `json:"devices"`              // paired plugins (TVs) with names and timestamps
 	Pending           []PendingJob `json:"pending"`              // active downloads, re-added on startup
+	History           []HistEntry  `json:"history"`              // completed downloads (newest last), capped
 }
+
+// Device is a paired plugin (a TV). Pub is the trust anchor; Name is only for
+// the panel. LastSeen updates when a job/command arrives from this key.
+type Device struct {
+	Pub      string `json:"pub"`       // base64 plugin public key
+	Name     string `json:"name"`      // user-editable label
+	AddedAt  int64  `json:"added_at"`  // unix seconds
+	LastSeen int64  `json:"last_seen"` // unix seconds, 0 = never
+}
+
+// HistEntry is one completed download, persisted so the list survives restarts.
+type HistEntry struct {
+	Name string `json:"name"`
+	Dir  string `json:"dir"`  // category folder (Movies/Shows/Other)
+	MiB  int64  `json:"mib"`  // total size
+	Done int64  `json:"done"` // unix seconds of completion
+}
+
+const historyCap = 50
 
 // PendingJob is persisted so an interrupted download resumes after a restart
 // (part files hold the data; re-adding rechecks and continues from disk).
@@ -54,6 +76,20 @@ type PendingJob struct {
 }
 
 var magnetRe = regexp.MustCompile(`^magnet:\?xt=urn:btih:[0-9A-Fa-f]{40}([0-9A-Za-z]{32})?.*`)
+
+// btihRe extracts the infohash (hex-40 or base32-32) for job deduplication.
+var btihRe = regexp.MustCompile(`btih:([0-9A-Fa-f]{40}|[0-9A-Za-z]{32})`)
+
+// infoHash returns the normalized infohash of a magnet, or "" if none found.
+// Two magnets with the same infohash are the same torrent regardless of
+// trackers/names, so this is the dedup key.
+func infoHash(magnet string) string {
+	m := btihRe.FindStringSubmatch(magnet)
+	if m == nil {
+		return ""
+	}
+	return strings.ToLower(m[1])
+}
 
 func deriveCode(pub []byte) string {
 	h := sha256.Sum256(pub)
@@ -158,7 +194,8 @@ type Agent struct {
 
 	mu      sync.Mutex
 	jobs    map[string]*Job
-	trusted map[string]bool
+	devices map[string]*Device // by plugin pub (base64)
+	conn    *websocket.Conn    // current relay conn; closed on key reset to re-hello
 	relayUp bool
 	uiToken string
 	logPath string
@@ -167,14 +204,66 @@ type Agent struct {
 	outCh chan map[string]any // to current ws writer (best-effort)
 }
 
+// validKeys reports whether both keys decode to 32 bytes. Broken keys mean a
+// broken identity: the pairing code and all trust are derived from them, so a
+// config that fails this check is treated the same as unparseable JSON.
+func validKeys(c *Config) bool {
+	return len(unb64(c.Priv)) == 32 && len(unb64(c.Pub)) == 32
+}
+
+// normalizeConfig migrates legacy fields and fills safe defaults in place.
+func normalizeConfig(c *Config) {
+	// <= v1.0.6 stored bare keys in "trusted"; wrap them into Devices once.
+	for _, k := range c.Trusted {
+		dup := false
+		for _, d := range c.Devices {
+			if d.Pub == k {
+				dup = true
+				break
+			}
+		}
+		if !dup && len(unb64(k)) == 32 {
+			c.Devices = append(c.Devices, Device{
+				Pub: k, Name: defaultDevName(k), AddedAt: time.Now().Unix(),
+			})
+		}
+	}
+	c.Trusted = nil
+	if c.DownloadDir == "" {
+		home, _ := os.UserHomeDir()
+		c.DownloadDir = filepath.Join(home, "Downloads", "Lampa")
+	}
+	if len(c.History) > historyCap {
+		c.History = c.History[len(c.History)-historyCap:]
+	}
+}
+
+// defaultDevName derives a stable readable label from a plugin key ("ТВ 7725").
+func defaultDevName(pubB string) string {
+	p := unb64(pubB)
+	if len(p) != 32 {
+		return "ТВ"
+	}
+	return "ТВ " + deriveCode(p)[:4]
+}
+
 func loadOrInitConfig(path string) (Config, error) {
 	var c Config
 	b, err := os.ReadFile(path)
 	if err == nil {
-		if err := json.Unmarshal(b, &c); err != nil {
-			return c, fmt.Errorf("config parse: %w", err)
+		if jerr := json.Unmarshal(b, &c); jerr == nil && validKeys(&c) {
+			normalizeConfig(&c)
+			return c, nil
 		}
-		return c, nil
+		// Broken config (bad JSON or corrupt keys): keep the evidence next to
+		// it and start fresh, instead of refusing to launch at all.
+		bak := path + ".broken-" + time.Now().Format("20060102-150405")
+		if werr := os.WriteFile(bak, b, 0600); werr == nil {
+			log.Printf("config unreadable, backed up to %s and re-initialized", bak)
+		} else {
+			log.Printf("config unreadable and backup failed (%v); re-initializing", werr)
+		}
+		c = Config{}
 	}
 	// fresh: generate keypair and persist it right away, so the pairing code
 	// stays the same across restarts even if we crash before the first save.
@@ -197,28 +286,58 @@ func loadOrInitConfig(path string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
-		return c, fmt.Errorf("config save: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := writeFileAtomic(path, b); err != nil {
 		return c, fmt.Errorf("config save: %w", err)
 	}
 	return c, nil
 }
 
-func (a *Agent) saveConfig() {
-	a.cfg.Trusted = a.cfg.Trusted[:0]
-	for k := range a.trusted {
-		a.cfg.Trusted = append(a.cfg.Trusted, k)
+// writeFileAtomic writes via tmp + fsync + rename, so a crash or power loss
+// mid-write can never leave a truncated agent.json behind.
+func writeFileAtomic(path string, b []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
 	}
-	b, _ := json.MarshalIndent(a.cfg, "", "  ")
-	tmp := a.cfgPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
-		log.Printf("config save: %v", err)
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (a *Agent) saveConfig() {
+	a.mu.Lock()
+	a.cfg.Devices = a.cfg.Devices[:0]
+	for _, d := range a.devices {
+		a.cfg.Devices = append(a.cfg.Devices, *d)
+	}
+	sort.Slice(a.cfg.Devices, func(i, j int) bool { // stable file: oldest first
+		if a.cfg.Devices[i].AddedAt != a.cfg.Devices[j].AddedAt {
+			return a.cfg.Devices[i].AddedAt < a.cfg.Devices[j].AddedAt
+		}
+		return a.cfg.Devices[i].Pub < a.cfg.Devices[j].Pub
+	})
+	b, merr := json.MarshalIndent(a.cfg, "", "  ")
+	a.mu.Unlock()
+	if merr != nil {
+		log.Printf("config save: %v", merr)
 		return
 	}
-	os.Rename(tmp, a.cfgPath)
+	if err := writeFileAtomic(a.cfgPath, b); err != nil {
+		log.Printf("config save: %v", err)
+	}
 }
 
 func (a *Agent) addPending(magnet, dir, name string) {
@@ -272,10 +391,12 @@ func (a *Agent) connectLoop(wsURL string) {
 		backoff = time.Second
 		a.mu.Lock()
 		a.relayUp = true
+		a.conn = conn
 		a.mu.Unlock()
 		a.handleConn(conn)
 		a.mu.Lock()
 		a.relayUp = false
+		a.conn = nil
 		a.mu.Unlock()
 		log.Printf("relay disconnected, reconnecting")
 	}
@@ -285,9 +406,13 @@ func (a *Agent) handleConn(conn *websocket.Conn) {
 	defer conn.Close()
 	done := make(chan struct{})
 
-	// hello first, directly (ordering guaranteed)
+	// hello first, directly (ordering guaranteed); pub/code are read under the
+	// lock because a key reset from the panel replaces both.
+	a.mu.Lock()
+	helloPub, helloCode := a.cfg.Pub, a.code
+	a.mu.Unlock()
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := conn.WriteJSON(map[string]any{"type": "hello", "pub": a.cfg.Pub, "id": a.code}); err != nil {
+	if err := conn.WriteJSON(map[string]any{"type": "hello", "pub": helloPub, "id": helloCode}); err != nil {
 		return
 	}
 
@@ -345,16 +470,89 @@ func (a *Agent) onPaired(pubB string) {
 	if len(unb64(pubB)) != 32 {
 		return
 	}
+	now := time.Now().Unix()
 	a.mu.Lock()
-	fresh := !a.trusted[pubB]
-	a.trusted[pubB] = true
-	a.mu.Unlock()
-	if fresh {
-		a.saveConfig()
-		log.Printf("paired with a new plugin (trusted key added)")
+	d, known := a.devices[pubB]
+	if known {
+		d.LastSeen = now
 	} else {
-		log.Printf("re-paired with a known plugin")
+		a.devices[pubB] = &Device{Pub: pubB, Name: defaultDevName(pubB), AddedAt: now, LastSeen: now}
 	}
+	a.mu.Unlock()
+	a.saveConfig()
+	if known {
+		log.Printf("re-paired with a known device")
+	} else {
+		log.Printf("paired with a new device (%s)", defaultDevName(pubB))
+	}
+}
+
+// touchDevice records activity from a paired plugin (best-effort persistence).
+func (a *Agent) touchDevice(pubB string) {
+	a.mu.Lock()
+	d := a.devices[pubB]
+	if d != nil {
+		d.LastSeen = time.Now().Unix()
+	}
+	a.mu.Unlock()
+	if d != nil {
+		a.saveConfig()
+	}
+}
+
+// renameDevice sets a user label for a paired device.
+func (a *Agent) renameDevice(pubB, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || len([]rune(name)) > 40 {
+		return fmt.Errorf("имя: от 1 до 40 символов")
+	}
+	a.mu.Lock()
+	d := a.devices[pubB]
+	if d != nil {
+		d.Name = name
+	}
+	a.mu.Unlock()
+	if d == nil {
+		return fmt.Errorf("устройство не найдено")
+	}
+	a.saveConfig()
+	log.Printf("device renamed to %q", name)
+	return nil
+}
+
+// revokeDevice removes trust: jobs and commands from this key are dropped
+// from now on. Active downloads are not touched.
+func (a *Agent) revokeDevice(pubB string) {
+	a.mu.Lock()
+	_, ok := a.devices[pubB]
+	delete(a.devices, pubB)
+	a.mu.Unlock()
+	if ok {
+		a.saveConfig()
+		log.Printf("device access revoked")
+	}
+}
+
+// resetKeys generates a fresh identity: new pairing code, all devices revoked.
+// The relay connection is closed so the reconnect re-hellos with the new code.
+func (a *Agent) resetKeys() error {
+	pub, priv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.cfg.Priv, a.cfg.Pub = b64(priv[:]), b64(pub[:])
+	a.priv, a.pub = priv, pub
+	a.code = deriveCode(pub[:])
+	a.devices = make(map[string]*Device)
+	conn := a.conn
+	a.mu.Unlock()
+	a.saveConfig()
+	if conn != nil {
+		conn.Close() // connectLoop redials and registers the new code
+	}
+	log.Printf("keys reset: new pairing code, all devices revoked")
+	return nil
 }
 
 // onCmd handles a control command from a paired plugin (pause/resume/cancel).
@@ -362,7 +560,8 @@ func (a *Agent) onPaired(pubB string) {
 func (a *Agent) onCmd(m map[string]any) {
 	pubB := str(m["pub"])
 	a.mu.Lock()
-	trusted := a.trusted[pubB]
+	_, trusted := a.devices[pubB]
+	priv := a.priv // snapshot: key reset swaps the pointer
 	a.mu.Unlock()
 	if !trusted {
 		log.Printf("cmd from untrusted key -> dropped")
@@ -377,7 +576,7 @@ func (a *Agent) onCmd(m map[string]any) {
 	var peer [32]byte
 	copy(peer[:], unb64(pubB))
 
-	pt, ok := box.Open(nil, unb64(str(m["ct"])), &nonce, &peer, a.priv)
+	pt, ok := box.Open(nil, unb64(str(m["ct"])), &nonce, &peer, priv)
 	if !ok {
 		log.Printf("cmd decrypt failed -> dropped")
 		return
@@ -390,6 +589,7 @@ func (a *Agent) onCmd(m map[string]any) {
 		log.Printf("cmd payload parse failed -> dropped")
 		return
 	}
+	a.touchDevice(pubB)
 	switch payload.Act {
 	case "pause":
 		a.pauseJob(payload.ID)
@@ -405,7 +605,8 @@ func (a *Agent) onCmd(m map[string]any) {
 func (a *Agent) onJob(m map[string]any) {
 	pubB := str(m["pub"])
 	a.mu.Lock()
-	trusted := a.trusted[pubB]
+	_, trusted := a.devices[pubB]
+	priv := a.priv // snapshot: key reset swaps the pointer
 	a.mu.Unlock()
 	if !trusted {
 		log.Printf("job from untrusted key -> dropped")
@@ -420,7 +621,7 @@ func (a *Agent) onJob(m map[string]any) {
 	var peer [32]byte
 	copy(peer[:], unb64(pubB))
 
-	pt, ok := box.Open(nil, unb64(str(m["ct"])), &nonce, &peer, a.priv)
+	pt, ok := box.Open(nil, unb64(str(m["ct"])), &nonce, &peer, priv)
 	if !ok {
 		log.Printf("job decrypt failed -> dropped")
 		return
@@ -442,6 +643,7 @@ func (a *Agent) onJob(m map[string]any) {
 	if !ok {
 		dir = "Other" // unknown category never becomes raw path input
 	}
+	a.touchDevice(pubB)
 	id := str(m["id"])
 	go a.startDownload(id, payload.Magnet, dir, payload.Name)
 }
@@ -605,8 +807,20 @@ func (a *Agent) failJob(j *Job, reason string) {
 func (a *Agent) startDownload(id, magnet, catDir, name string) {
 	target := filepath.Join(a.cfg.DownloadDir, catDir)
 
-	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, state: "connecting"}
+	// Dedup: the same torrent sent twice (double-click on the remote, resend
+	// after a hiccup) must not spawn a second competing job over the same files.
+	ih := infoHash(magnet)
 	a.mu.Lock()
+	if ih != "" {
+		for _, ex := range a.jobs {
+			if ex.state != "error" && infoHash(ex.magnet) == ih {
+				a.mu.Unlock()
+				log.Printf("job %s duplicate of active %q -> skipped", id, ex.name)
+				return
+			}
+		}
+	}
+	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, state: "connecting"}
 	a.jobs[id] = j
 	a.mu.Unlock()
 
@@ -727,6 +941,7 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 	a.mu.Unlock()
 
 	a.removePending(magnet) // done downloading; no longer needs resume
+	a.addHistory(HistEntry{Name: name, Dir: catDir, MiB: total / (1 << 20), Done: time.Now().Unix()})
 	if a.cfg.KeepSeeding {
 		a.setState(j, "seeding")
 		log.Printf("job %s complete: %q (seeding)", id, name)
@@ -735,6 +950,26 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 		a.setState(j, "done")
 		log.Printf("job %s complete: %q (stopped)", id, name)
 	}
+}
+
+// addHistory persists a completed download (newest last, capped), so the list
+// survives agent restarts.
+func (a *Agent) addHistory(h HistEntry) {
+	a.mu.Lock()
+	a.cfg.History = append(a.cfg.History, h)
+	if len(a.cfg.History) > historyCap {
+		a.cfg.History = a.cfg.History[len(a.cfg.History)-historyCap:]
+	}
+	a.mu.Unlock()
+	a.saveConfig()
+}
+
+// clearHistory wipes the completed-downloads list (files are untouched).
+func (a *Agent) clearHistory() {
+	a.mu.Lock()
+	a.cfg.History = nil
+	a.mu.Unlock()
+	a.saveConfig()
 }
 
 func (a *Agent) setState(j *Job, s string) {
@@ -907,13 +1142,14 @@ func main() {
 		pub:     &pub,
 		code:    deriveCode(pub[:]),
 		jobs:    make(map[string]*Job),
-		trusted: make(map[string]bool),
+		devices: make(map[string]*Device),
 		outCh:   make(chan map[string]any, 32),
 	}
-	for _, k := range cfg.Trusted {
-		a.trusted[k] = true
+	for i := range cfg.Devices {
+		d := cfg.Devices[i]
+		a.devices[d.Pub] = &d
 	}
-	a.saveConfig() // persist freshly-generated keys / normalize
+	a.saveConfig() // persist freshly-generated keys / migrated legacy fields
 
 	uiAddr := *uiAddrFlag
 	uiURL := "http://127.0.0.1" + uiAddr[strings.LastIndex(uiAddr, ":"):]

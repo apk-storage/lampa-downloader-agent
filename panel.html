@@ -68,8 +68,19 @@ button:hover{background:#383838}
 </div>
 
 <div class="card">
+  <div class="label">Подключённые ТВ</div>
+  <div id="devs"><div class="empty">Пока никто не подключён</div></div>
+  <div style="margin-top:12px"><button onclick="resetKey()" style="font-size:12px;color:#e05a5a">Сбросить ключ и код…</button></div>
+</div>
+
+<div class="card">
   <div class="label">Загрузки</div>
   <div id="jobs"><div class="empty">Пока пусто</div></div>
+</div>
+
+<div class="card">
+  <div class="label">История <button onclick="clearHist()" class="jb" style="float:right">Очистить</button></div>
+  <div id="hist"><div class="empty">Завершённых загрузок пока нет</div></div>
 </div>
 
 <script>
@@ -120,6 +131,58 @@ document.getElementById('brList').addEventListener('click',function(e){
   if(!el)return;var i=+el.getAttribute('data-i');if(brDirs[i])brGo(brDirs[i].path);
 });
 function cancelJob(id){if(confirm('Отменить эту загрузку?')){post('/api/cancel?id='+encodeURIComponent(id)).then(tick)}}
+function fmtDate(u){if(!u)return 'ещё не был на связи';var d=new Date(u*1000);return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit'})+' '+d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}
+function fmtSize(mib){if(mib>=1024)return (mib/1024).toFixed(1)+' ГиБ';return mib+' МиБ'}
+var devEditing=null; // pub устройства, чьё имя сейчас редактируется
+function renderDevs(devs){
+  var box=document.getElementById('devs');
+  if(devEditing!==null)return; // не перерисовывать под руками у пользователя
+  if(!devs||!devs.length){box.innerHTML='<div class="empty">Пока никто не подключён</div>';return}
+  box.innerHTML=devs.map(function(d,i){
+    return '<div class="dl" style="display:flex;align-items:center;gap:10px">'+
+      '<div style="flex:1;min-width:0"><div class="dl-name dev-name" data-i="'+i+'" title="Нажмите, чтобы переименовать" style="cursor:pointer">'+esc(d.name)+' ✎</div>'+
+      '<div class="meta">был на связи: '+fmtDate(d.last_seen)+'</div></div>'+
+      '<button class="jb dev-del" data-i="'+i+'">Отключить</button></div>';
+  }).join('');
+  box._devs=devs;
+}
+document.getElementById('devs').addEventListener('click',function(e){
+  var devs=document.getElementById('devs')._devs||[];
+  var del=e.target.closest&&e.target.closest('.dev-del');
+  if(del){var d=devs[+del.getAttribute('data-i')];
+    if(d&&confirm('Отключить «'+d.name+'»? Этот ТВ больше не сможет присылать загрузки.')){
+      post('/api/device/revoke?pub='+encodeURIComponent(d.pub)).then(tick)}
+    return}
+  var nm=e.target.closest&&e.target.closest('.dev-name');
+  if(nm){var d2=devs[+nm.getAttribute('data-i')];if(!d2)return;
+    devEditing=d2.pub;
+    var inp=document.createElement('input');
+    inp.value=d2.name;inp.className='path';inp.style.fontSize='14px';inp.maxLength=40;
+    nm.replaceWith(inp);inp.focus();inp.select();
+    function done(save){
+      devEditing=null;
+      if(save&&inp.value.trim()&&inp.value.trim()!==d2.name){
+        post('/api/device/rename?pub='+encodeURIComponent(d2.pub)+'&name='+encodeURIComponent(inp.value.trim())).then(tick)
+      } else tick();
+    }
+    inp.addEventListener('keydown',function(ev){if(ev.key==='Enter'){ev.preventDefault();done(true)}if(ev.key==='Escape')done(false)});
+    inp.addEventListener('blur',function(){done(true)});
+  }
+});
+function resetKey(){
+  if(confirm('Сбросить ключ? Появится новый код, ВСЕ подключённые ТВ будут отключены — их придётся подключать заново.')){
+    post('/api/resetkey').then(tick)
+  }
+}
+function renderHist(hist){
+  var box=document.getElementById('hist');
+  if(!hist||!hist.length){box.innerHTML='<div class="empty">Завершённых загрузок пока нет</div>';return}
+  box.innerHTML=hist.map(function(h){
+    return '<div class="dl"><div class="dl-name">'+esc(h.name||'Загрузка')+'</div>'+
+      '<div class="meta">'+fmtSize(h.mib||0)+' · '+esc(h.dir||'')+' · '+fmtDate(h.done)+'</div></div>';
+  }).join('');
+}
+function clearHist(){if(confirm('Очистить историю? Файлы на диске останутся.')){post('/api/history/clear').then(tick)}}
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){post('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
@@ -129,6 +192,8 @@ function tick(){
     document.getElementById('dot').className='dot'+(d.relay?' on':'');
     document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';
     if(d.version)document.getElementById('ver').textContent='Lampa Downloader '+d.version;
+    renderDevs(d.devices);
+    renderHist(d.history);
     var box=document.getElementById('jobs');
     if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
     box.innerHTML=d.jobs.map(function(j){
