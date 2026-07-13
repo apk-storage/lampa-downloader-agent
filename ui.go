@@ -149,6 +149,7 @@ type uiJobResp struct {
 	Peers    int    `json:"peers"`
 	Seeds    int    `json:"seeds"`
 	Paused   bool   `json:"paused"`
+	Err      string `json:"err,omitempty"`
 }
 type uiStateResp struct {
 	Code    string      `json:"code"`
@@ -277,6 +278,7 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 			ID: j.id, Name: j.name, Pct: pct, State: j.state,
 			DoneMiB: done / (1 << 20), TotalMiB: total / (1 << 20),
 			Speed: j.speed, ETA: eta, Peers: peers, Seeds: seeds, Paused: j.paused,
+			Err: j.err,
 		})
 	}
 	up := a.relayUp

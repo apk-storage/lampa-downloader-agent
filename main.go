@@ -136,7 +136,8 @@ type Job struct {
 	magnet string // for pending removal on cancel
 	dir    string // category subfolder, for cleanup on cancel
 	t      *torrent.Torrent
-	state  string // connecting|downloading|paused|seeding|done
+	state  string // connecting|downloading|paused|seeding|done|error
+	err    string // human-readable failure reason (state == "error")
 	pct    int
 	paused bool
 
@@ -589,38 +590,73 @@ func fileStorage(dir string) storage.ClientImpl {
 	return storage.NewFileWithCompletion(dir, storage.NewMapPieceCompletion())
 }
 
+// failJob marks a job as failed with a human-readable reason, visible in the
+// panel and on the TV instead of a silent hang.
+func (a *Agent) failJob(j *Job, reason string) {
+	a.mu.Lock()
+	j.state = "error"
+	j.err = reason
+	j.speed = 0
+	a.mu.Unlock()
+	a.pushStatus()
+	log.Printf("job %s failed: %q — %s", j.id, j.name, reason)
+}
+
 func (a *Agent) startDownload(id, magnet, catDir, name string) {
 	target := filepath.Join(a.cfg.DownloadDir, catDir)
+
+	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, state: "connecting"}
+	a.mu.Lock()
+	a.jobs[id] = j
+	a.mu.Unlock()
+
 	if err := os.MkdirAll(target, 0755); err != nil {
-		log.Printf("mkdir %s: %v", target, err)
+		a.failJob(j, dirErrRu(err))
 		return
 	}
 	spec, err := torrent.TorrentSpecFromMagnetUri(magnet)
 	if err != nil {
-		log.Printf("bad magnet: %v", err)
+		a.failJob(j, "Некорректная ссылка")
 		return
 	}
 	spec.Storage = fileStorage(target)
 
 	t, _, err := a.tc.AddTorrentSpec(spec)
 	if err != nil {
-		log.Printf("add torrent: %v", err)
+		a.failJob(j, "Не удалось добавить торрент")
+		return
+	}
+	a.mu.Lock()
+	j.t = t
+	a.mu.Unlock()
+
+	a.addPending(magnet, catDir, name) // persist so a restart resumes it
+	log.Printf("job %s queued: %q -> %s", id, name, target)
+
+	// Metadata (peer discovery) must arrive in reasonable time; otherwise the
+	// job would sit on "connecting" forever with no explanation.
+	select {
+	case <-t.GotInfo():
+	case <-time.After(5 * time.Minute):
+		a.failJob(j, "Не найдены пиры — раздача недоступна")
+		func() { defer func() { _ = recover() }(); t.Drop() }()
+		a.removePending(magnet)
 		return
 	}
 
-	a.addPending(magnet, catDir, name) // persist so a restart resumes it
+	total := t.Length()
+	if free, err := freeSpace(target); err == nil && free > 0 && free < total {
+		a.failJob(j, fmt.Sprintf("Недостаточно места: нужно %d ГиБ, свободно %d ГиБ",
+			total/(1<<30)+1, free/(1<<30)))
+		func() { defer func() { _ = recover() }(); t.Drop() }()
+		a.removePending(magnet)
+		return
+	}
 
-	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, t: t, state: "connecting"}
-	a.mu.Lock()
-	a.jobs[id] = j
-	a.mu.Unlock()
-	log.Printf("job %s queued: %q -> %s", id, name, target)
-
-	<-t.GotInfo()
 	t.DownloadAll()
 	a.setState(j, "downloading")
 
-	total := t.Length()
+	stalledSince := time.Time{}
 	for {
 		done := t.BytesCompleted()
 		pct := 0
@@ -630,6 +666,10 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 		now := time.Now()
 
 		a.mu.Lock()
+		if j.state == "error" { // cancelled or failed elsewhere
+			a.mu.Unlock()
+			return
+		}
 		j.pct = pct
 		// speed: exponentially smoothed bytes/sec between samples
 		if !j.lastAt.IsZero() && !j.paused {
@@ -649,11 +689,36 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 		if !j.paused && j.state == "connecting" {
 			j.state = "downloading"
 		}
+		paused := j.paused
+		speed := j.speed
 		a.mu.Unlock()
 
 		if done >= total && total > 0 {
 			break
 		}
+
+		// Stall detection: no data and no peers for a long time means the swarm
+		// is dead — say so instead of spinning at 0% forever.
+		if !paused && speed == 0 {
+			peers := 0
+			func() {
+				defer func() { _ = recover() }()
+				peers = t.Stats().ActivePeers
+			}()
+			if peers == 0 {
+				if stalledSince.IsZero() {
+					stalledSince = now
+				} else if now.Sub(stalledSince) > 10*time.Minute {
+					a.failJob(j, "Нет пиров — загрузка остановилась")
+					return
+				}
+			} else {
+				stalledSince = time.Time{}
+			}
+		} else {
+			stalledSince = time.Time{}
+		}
+
 		time.Sleep(1 * time.Second)
 	}
 
@@ -725,7 +790,7 @@ func (a *Agent) pushStatus() {
 	for _, j := range a.jobs {
 		jobs = append(jobs, map[string]any{
 			"id": j.id, "pct": j.pct, "state": j.state, "paused": j.paused,
-			"speed": j.speed,
+			"speed": j.speed, "err": j.err,
 		})
 	}
 	a.mu.Unlock()
@@ -757,6 +822,7 @@ func (a *Agent) statusLoop() {
 				"id": j.id, "pct": j.pct, "state": j.state,
 				"speed": j.speed, "eta": eta,
 				"peers": peers, "seeds": seeds, "paused": j.paused,
+				"err": j.err,
 			})
 		}
 		a.mu.Unlock()

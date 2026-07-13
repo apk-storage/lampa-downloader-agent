@@ -75,7 +75,7 @@ button:hover{background:#383838}
 <script>
 function post(u){return fetch(u,{method:'POST'})}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
-function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':s==='paused'?'пауза':'скачивание'}
+function stateRu(s){return s==='done'?'готово':s==='seeding'?'раздаётся':s==='connecting'?'подключение':s==='paused'?'пауза':s==='error'?'ошибка':'скачивание'}
 function fmtSpeed(b){if(!b)return '';if(b>1048576)return (b/1048576).toFixed(1)+' МБ/с';if(b>1024)return Math.round(b/1024)+' КБ/с';return b+' Б/с'}
 function fmtEta(s){if(s==null||s<0)return '';if(s<60)return s+' сек';if(s<3600)return Math.round(s/60)+' мин';var h=Math.floor(s/3600),m=Math.round((s%3600)/60);return h+' ч '+m+' мин'}
 function pauseJob(id){post('/api/pause?id='+encodeURIComponent(id)).then(tick)}
@@ -133,18 +133,23 @@ function tick(){
     if(!d.jobs||!d.jobs.length){box.innerHTML='<div class="empty">Пока пусто</div>';return}
     box.innerHTML=d.jobs.map(function(j){
       var pct=Math.max(0,Math.min(100,j.pct||0));
-      var bits=[stateRu(j.state), pct+'%', (j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ'];
-      var sp=fmtSpeed(j.speed); if(sp) bits.push(sp);
-      var eta=fmtEta(j.eta); if(eta && !j.paused) bits.push('осталось '+eta);
-      if(j.peers||j.seeds) bits.push('пиры '+(j.peers||0)+' · сиды '+(j.seeds||0));
+      var err=(j.state==='error');
+      var bits;
+      if(err){ bits=[j.err||'ошибка']; }
+      else {
+        bits=[stateRu(j.state), pct+'%', (j.done_mib||0)+'/'+(j.total_mib||0)+' МиБ'];
+        var sp=fmtSpeed(j.speed); if(sp) bits.push(sp);
+        var eta=fmtEta(j.eta); if(eta && !j.paused) bits.push('осталось '+eta);
+        if(j.peers||j.seeds) bits.push('пиры '+(j.peers||0)+' · сиды '+(j.seeds||0));
+      }
       var pb=j.paused
         ? '<button class="jb" data-act="resume" data-id="'+esc(j.id)+'">▶</button>'
         : '<button class="jb" data-act="pause"  data-id="'+esc(j.id)+'">❚❚</button>';
-      var done=(j.state==='done'||j.state==='seeding');
+      var done=(j.state==='done'||j.state==='seeding'||err);
       return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+
         '<span style="float:right">'+(done?'':pb)+'<button class="jb" data-act="cancel" data-id="'+esc(j.id)+'">✕</button></span></div>'+
         '<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>'+
-        '<div class="meta">'+bits.join(' · ')+'</div></div>';
+        '<div class="meta"'+(err?' style="color:#e05a5a;opacity:1"':'')+'>'+bits.join(' · ')+'</div></div>';
     }).join('');
   }).catch(function(){});
 }
