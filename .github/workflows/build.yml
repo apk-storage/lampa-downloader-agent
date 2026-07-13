@@ -52,11 +52,14 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # disable_libutp: uTP на чистом Go вместо C-библиотеки go-libutp,
+      # которая не компилируется современным MinGW (typedef uint8 bool).
+      # CGO остаётся включённым — он нужен для нативного окна (webview).
       - name: Build Windows (native webview, CGO)
         env: { GOOS: windows, GOARCH: amd64, CGO_ENABLED: '1' }
         run: |
-          go build -ldflags "-H=windowsgui -X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent.exe .
-          go build -ldflags "-X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent-console.exe .
+          go build -tags disable_libutp -ldflags "-H=windowsgui -X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent.exe .
+          go build -tags disable_libutp -ldflags "-X main.version=${{ steps.ver.outputs.v }}" -o lampa-agent-console.exe .
 
       - name: Build macOS + Linux (cross, no CGO)
         env: { LDF: "-X main.version=${{ steps.ver.outputs.v }}" }
