@@ -183,6 +183,15 @@ func setupLogging(cfgPath string) string {
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
+// loopbackBind reports whether the bind address only listens on loopback.
+func loopbackBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false // can't tell -> treat as external, demand a token
+	}
+	return host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 func randID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -241,11 +250,20 @@ type Agent struct {
 	cfgSeq   uint64             // bumped per snapshot (under mu)
 	savedSeq uint64             // last snapshot on disk (under saveMu)
 	devices  map[string]*Device // by plugin pub (base64)
-	conn     *websocket.Conn    // current relay conn; closed on key reset to re-hello
-	relayUp  bool
-	uiToken  string
-	logPath  string
-	started  time.Time
+
+	// pairing window (pairing v2): NEW devices are accepted only while the
+	// window is open; already-trusted devices re-pair at any time.
+	pairUntil time.Time
+	pairLeft  int
+
+	// replay protection: recently seen message nonces (base64 -> unix seconds)
+	seenNonces map[string]int64
+	conn       *websocket.Conn // current relay conn; closed on key reset to re-hello
+	relayUp    bool
+	uiToken    string
+	uiPort     string // panel's own port, for the strict Origin check
+	logPath    string
+	started    time.Time
 
 	outCh chan map[string]any // to current ws writer (best-effort)
 }
@@ -509,7 +527,9 @@ func (a *Agent) handleConn(conn *websocket.Conn) {
 			return
 		}
 		switch m["type"] {
-		case "paired":
+		case "pair": // pairing v2: relay waits for our verdict
+			a.onPairRequest(m)
+		case "paired": // legacy relay: no confirmation round-trip
 			a.onPaired(str(m["pub"]))
 		case "job":
 			a.onJob(m)
@@ -524,25 +544,117 @@ func str(v any) string {
 	return s
 }
 
-func (a *Agent) onPaired(pubB string) {
-	if len(unb64(pubB)) != 32 {
-		return
-	}
-	now := time.Now().Unix()
+// Pairing window: how long the panel button opens it, how long the first-run
+// grace period lasts, and how many NEW devices one window may admit.
+const (
+	pairWindowDur   = 10 * time.Minute
+	pairFirstRunDur = 15 * time.Minute
+	pairMaxAccepts  = 5
+)
+
+// openPairWindow (re)opens the pairing window for d.
+func (a *Agent) openPairWindow(d time.Duration) {
 	a.mu.Lock()
-	d, known := a.devices[pubB]
-	if known {
-		d.LastSeen = now
-	} else {
-		a.devices[pubB] = &Device{Pub: pubB, Name: defaultDevName(pubB), AddedAt: now, LastSeen: now}
+	a.pairUntil = time.Now().Add(d)
+	a.pairLeft = pairMaxAccepts
+	a.mu.Unlock()
+	log.Printf("pairing window open for %s (up to %d new devices)", d, pairMaxAccepts)
+}
+
+// pairWindowLeft returns the remaining window seconds (0 = closed).
+func (a *Agent) pairWindowLeft() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pairLeft <= 0 {
+		return 0
 	}
+	left := int(time.Until(a.pairUntil).Seconds())
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+// acceptPair decides whether to trust pubB and records it if so.
+// Known devices always re-pair (plugin re-pairs after cache resets etc);
+// NEW devices are admitted only through an open pairing window — this is what
+// makes a leaked 6-digit code useless and makes revocation actually stick.
+func (a *Agent) acceptPair(pubB string) bool {
+	if len(unb64(pubB)) != 32 {
+		return false
+	}
+	now := time.Now()
+	a.mu.Lock()
+	if d, known := a.devices[pubB]; known {
+		d.LastSeen = now.Unix()
+		a.mu.Unlock()
+		a.saveConfig()
+		log.Printf("re-paired with a known device")
+		return true
+	}
+	if now.After(a.pairUntil) || a.pairLeft <= 0 {
+		a.mu.Unlock()
+		log.Printf("pairing rejected: window closed — press «Разрешить подключение» in the panel")
+		return false
+	}
+	a.pairLeft--
+	left := a.pairLeft
+	a.devices[pubB] = &Device{Pub: pubB, Name: defaultDevName(pubB), AddedAt: now.Unix(), LastSeen: now.Unix()}
 	a.mu.Unlock()
 	a.saveConfig()
-	if known {
-		log.Printf("re-paired with a known device")
-	} else {
-		log.Printf("paired with a new device (%s)", defaultDevName(pubB))
+	log.Printf("paired with a new device (%s), window slots left: %d", defaultDevName(pubB), left)
+	return true
+}
+
+// onPairRequest answers the relay's pairing-v2 confirmation round-trip.
+func (a *Agent) onPairRequest(m map[string]any) {
+	ok := a.acceptPair(str(m["pub"]))
+	a.send(map[string]any{"type": "pair_result", "id": str(m["id"]), "ok": ok})
+}
+
+// onPaired is the legacy path (old relay pushes "paired" without asking).
+// Gated by the same rules, so a leaked code can't bypass the window here.
+func (a *Agent) onPaired(pubB string) {
+	a.acceptPair(pubB)
+}
+
+// seenNonce records a message nonce and reports whether it was already used
+// recently — a repeat means a replayed ciphertext, not an honest sender
+// (nonces are 24 random bytes, collisions don't happen by accident).
+func (a *Agent) seenNonce(n string) bool {
+	const ttl = 600 // seconds
+	now := time.Now().Unix()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.seenNonces == nil {
+		a.seenNonces = make(map[string]int64)
 	}
+	if len(a.seenNonces) > 4096 { // memory guard: GC expired entries
+		for k, ts := range a.seenNonces {
+			if now-ts > ttl {
+				delete(a.seenNonces, k)
+			}
+		}
+	}
+	if ts, dup := a.seenNonces[n]; dup && now-ts <= ttl {
+		return true
+	}
+	a.seenNonces[n] = now
+	return false
+}
+
+// freshTS enforces the optional timestamp inside encrypted payloads
+// (plugin >= v0.17). Zero means an old plugin — allowed, the nonce cache
+// still guards within the agent's uptime.
+func freshTS(ts int64) bool {
+	if ts == 0 {
+		return true
+	}
+	d := time.Now().Unix() - ts
+	if d < 0 {
+		d = -d
+	}
+	return d <= 300
 }
 
 // touchDevice records activity from a paired plugin (best-effort persistence).
@@ -630,6 +742,10 @@ func (a *Agent) onCmd(m map[string]any) {
 	if len(nb) != 24 {
 		return
 	}
+	if a.seenNonce(str(m["nonce"])) {
+		log.Printf("replayed nonce -> dropped")
+		return
+	}
 	copy(nonce[:], nb)
 	var peer [32]byte
 	copy(peer[:], unb64(pubB))
@@ -642,9 +758,14 @@ func (a *Agent) onCmd(m map[string]any) {
 	var payload struct {
 		Act string `json:"act"` // pause|resume|cancel
 		ID  string `json:"id"`  // job id
+		TS  int64  `json:"ts"`  // unix seconds (plugin >= v0.17), 0 for older
 	}
 	if err := json.Unmarshal(pt, &payload); err != nil || payload.ID == "" {
 		log.Printf("cmd payload parse failed -> dropped")
+		return
+	}
+	if !freshTS(payload.TS) {
+		log.Printf("cmd with a stale timestamp -> dropped (replay?)")
 		return
 	}
 	a.touchDevice(pubB)
@@ -675,6 +796,10 @@ func (a *Agent) onJob(m map[string]any) {
 	if len(nb) != 24 {
 		return
 	}
+	if a.seenNonce(str(m["nonce"])) {
+		log.Printf("replayed nonce -> dropped")
+		return
+	}
 	copy(nonce[:], nb)
 	var peer [32]byte
 	copy(peer[:], unb64(pubB))
@@ -688,9 +813,14 @@ func (a *Agent) onJob(m map[string]any) {
 		Magnet string `json:"magnet"`
 		Cat    string `json:"cat"`
 		Name   string `json:"name"`
+		TS     int64  `json:"ts"` // unix seconds (plugin >= v0.17), 0 for older
 	}
 	if err := json.Unmarshal(pt, &payload); err != nil {
 		log.Printf("job payload parse failed -> dropped")
+		return
+	}
+	if !freshTS(payload.TS) {
+		log.Printf("job with a stale timestamp -> dropped (replay?)")
 		return
 	}
 	if !validMagnet(payload.Magnet) {
@@ -1268,6 +1398,12 @@ func main() {
 	}
 	a.saveConfig() // persist freshly-generated keys / migrated legacy fields
 
+	// First run (nothing paired yet): open the pairing window automatically so
+	// the very first TV connects without hunting for the panel button.
+	if len(a.devices) == 0 {
+		a.openPairWindow(pairFirstRunDur)
+	}
+
 	uiAddr := *uiAddrFlag
 	uiURL := "http://127.0.0.1" + uiAddr[strings.LastIndex(uiAddr, ":"):]
 
@@ -1314,6 +1450,12 @@ func main() {
 	// apply the autostart preference from config (default: on for desktop)
 	if err := setAutostart(a.cfg.Autostart); err != nil {
 		log.Printf("autostart: %v", err)
+	}
+	if *uiToken == "" { // env is preferable: tokens in process args leak via ps
+		*uiToken = os.Getenv("UI_TOKEN")
+	}
+	if !loopbackBind(uiAddr) && *uiToken == "" {
+		log.Fatalf("панель на внешнем адресе (%s) требует токен: задайте -ui-token или переменную окружения UI_TOKEN", uiAddr)
 	}
 	a.uiToken = *uiToken
 	a.startUI(uiAddr)

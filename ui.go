@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -101,6 +102,11 @@ func (a *Agent) startUI(addr string) {
 		a.clearHistory()
 		w.Write([]byte("ok"))
 	}))
+	mux.HandleFunc("/api/pairmode", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		a.openPairWindow(pairWindowDur)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"pair_sec": a.pairWindowLeft()})
+	}))
 	mux.HandleFunc("/api/quit", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 		go osExit()
@@ -110,7 +116,22 @@ func (a *Agent) startUI(addr string) {
 	if a.uiToken != "" {
 		handler = a.authWrap(mux)
 	}
-	go http.ListenAndServe(addr, handler)
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		a.uiPort = p // strict Origin: scheme-agnostic host AND port match
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("panel server failed: %v — панель недоступна (порт занят?)", err)
+		}
+	}()
 }
 
 // mutate wraps a state-changing endpoint: it must be POST and same-origin.
@@ -123,7 +144,7 @@ func (a *Agent) mutate(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if !localOrigin(r) {
+		if !a.localOrigin(r) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
@@ -133,7 +154,7 @@ func (a *Agent) mutate(h http.HandlerFunc) http.HandlerFunc {
 
 // localOrigin allows requests from the panel itself (loopback) and rejects
 // cross-site ones. GET reads are unaffected; only mutations go through here.
-func localOrigin(r *http.Request) bool {
+func (a *Agent) localOrigin(r *http.Request) bool {
 	o := r.Header.Get("Origin")
 	if o == "" {
 		o = r.Header.Get("Referer")
@@ -147,7 +168,20 @@ func localOrigin(r *http.Request) bool {
 		return false
 	}
 	host := u.Hostname()
-	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return false
+	}
+	// A page served by ANOTHER local app (different port) is still cross-site:
+	// require the exact panel port. Default ports normalize to an empty string.
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return a.uiPort == "" || port == a.uiPort
 }
 
 // authWrap requires HTTP Basic Auth (any user, password == token) when a token
@@ -193,6 +227,8 @@ type uiStateResp struct {
 	Jobs    []uiJobResp `json:"jobs"`
 	Devices []uiDevResp `json:"devices"`
 	History []HistEntry `json:"history"`
+	PairSec int         `json:"pair_sec"`  // pairing window remaining, 0 = closed
+	PairN   int         `json:"pair_left"` // new-device slots left in the window
 }
 
 type uiSettingsResp struct {
@@ -335,6 +371,13 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 	}
 	code, dir, seed := fmtCode(a.code), a.cfg.DownloadDir, a.cfg.KeepSeeding
 	up := a.relayUp
+	pairSec := 0
+	if a.pairLeft > 0 {
+		if v := int(time.Until(a.pairUntil).Seconds()); v > 0 {
+			pairSec = v
+		}
+	}
+	pairN := a.pairLeft
 	a.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -347,6 +390,8 @@ func (a *Agent) uiState(w http.ResponseWriter, r *http.Request) {
 		Jobs:    jobs,
 		Devices: devs,
 		History: hist,
+		PairSec: pairSec,
+		PairN:   pairN,
 	})
 }
 

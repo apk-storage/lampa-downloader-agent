@@ -47,6 +47,10 @@ button:hover{background:#383838}
 <div class="card">
   <div class="label">Код для Лампы</div>
   <div class="code" id="code"></div>
+  <div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+    <button id="pairBtn" onclick="openPair()">Разрешить подключение</button>
+    <span class="meta" id="pairState"></span>
+  </div>
   <div class="muted" style="margin-top:10px;font-size:13px">Введите этот код в Лампе: Настройки → Lampa Downloader → Подключить ПК</div>
 </div>
 
@@ -183,11 +187,21 @@ function renderHist(hist){
   }).join('');
 }
 function clearHist(){if(confirm('Очистить историю? Файлы на диске останутся.')){post('/api/history/clear').then(tick)}}
+function openPair(){post('/api/pairmode').then(tick)}
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){post('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
     var code=document.getElementById('code');code.innerHTML='';
     (d.code||'').split(' ').join('').split('').forEach(function(c){var s=document.createElement('span');s.textContent=c;code.appendChild(s)});
+    var ps=document.getElementById('pairState'),pb2=document.getElementById('pairBtn');
+    if(d.pair_sec>0){
+      var mm=Math.floor(d.pair_sec/60),ss=d.pair_sec%60;
+      ps.textContent='подключение открыто ещё '+mm+':'+(ss<10?'0':'')+ss+' (мест: '+(d.pair_left||0)+')';
+      ps.style.color='#4a9e4a';pb2.textContent='Продлить';
+    } else {
+      ps.textContent='подключение новых ТВ закрыто';
+      ps.style.color='';pb2.textContent='Разрешить подключение';
+    }
     var di=document.getElementById('dir');if(document.activeElement!==di){di.value=d.dir||'';dirSaved=d.dir||'';}
     document.getElementById('dot').className='dot'+(d.relay?' on':'');
     document.getElementById('relay').textContent=d.relay?'на связи':'нет связи';

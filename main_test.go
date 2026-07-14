@@ -304,6 +304,7 @@ func TestRenameRevokeDevice(t *testing.T) {
 	plug, _, _ := box.GenerateKey(cryptoRand{})
 	pubB := b64(plug[:])
 	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	a.openPairWindow(time.Minute) // pairing v2: new devices need an open window
 	a.onPaired(pubB)
 	if len(a.devices) != 1 {
 		t.Fatal("pairing did not add a device")
@@ -443,3 +444,77 @@ func TestCancelLifecycleContract(t *testing.T) {
 type cryptoRand struct{}
 
 func (cryptoRand) Read(p []byte) (int, error) { return rand.Read(p) }
+
+// Pairing v2: new devices only through an open window; known devices always.
+func TestPairingWindow(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	k1, _, _ := box.GenerateKey(cryptoRand{})
+	k2, _, _ := box.GenerateKey(cryptoRand{})
+	k3, _, _ := box.GenerateKey(cryptoRand{})
+
+	// window closed: new device rejected
+	if a.acceptPair(b64(k1[:])) {
+		t.Fatal("new device accepted with the window closed")
+	}
+	if len(a.devices) != 0 {
+		t.Fatal("rejected pairing must not add trust")
+	}
+
+	// window open: accepted, slot consumed
+	a.openPairWindow(time.Minute)
+	if !a.acceptPair(b64(k1[:])) {
+		t.Fatal("new device rejected with the window open")
+	}
+	if a.pairLeft != pairMaxAccepts-1 {
+		t.Fatalf("slot not consumed: %d", a.pairLeft)
+	}
+
+	// known device: re-pairs even after the window closes
+	a.mu.Lock()
+	a.pairUntil = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	if !a.acceptPair(b64(k1[:])) {
+		t.Fatal("known device must re-pair with the window closed")
+	}
+	if a.acceptPair(b64(k2[:])) {
+		t.Fatal("new device accepted after window expiry")
+	}
+
+	// slots exhausted: window open but no capacity left
+	a.openPairWindow(time.Minute)
+	a.mu.Lock()
+	a.pairLeft = 0
+	a.mu.Unlock()
+	if a.acceptPair(b64(k3[:])) {
+		t.Fatal("new device accepted with zero slots left")
+	}
+	if a.pairWindowLeft() != 0 {
+		t.Fatal("window with zero slots must report as closed")
+	}
+}
+
+// Replay: the same nonce twice is a replayed ciphertext.
+func TestNonceReplay(t *testing.T) {
+	a := &Agent{}
+	if a.seenNonce("n1") {
+		t.Fatal("fresh nonce flagged as replay")
+	}
+	if !a.seenNonce("n1") {
+		t.Fatal("repeated nonce not flagged")
+	}
+	if a.seenNonce("n2") {
+		t.Fatal("different nonce flagged")
+	}
+}
+
+// Timestamps: 0 (old plugin) passes; fresh passes; stale/future rejected.
+func TestFreshTS(t *testing.T) {
+	now := time.Now().Unix()
+	if !freshTS(0) || !freshTS(now) || !freshTS(now-200) {
+		t.Fatal("legit timestamps rejected")
+	}
+	if freshTS(now-3600) || freshTS(now+3600) {
+		t.Fatal("stale/future timestamp accepted")
+	}
+}
