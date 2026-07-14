@@ -5,22 +5,35 @@
 <style>
 :root{--bg:#1b1b1b;--card:#242424;--soft:#2e2e2e;--line:#333;--text:#f2f2f2;--muted:#8f8f8f;--ok:#5aa15a;--fill:#e8e8e8}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:28px;max-width:640px;margin:0 auto}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:14px 18px;max-width:640px;margin:0 auto}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .top h1{font-size:18px;font-weight:600;margin:0}
 .dot{width:9px;height:9px;border-radius:50%;background:#666}
 .dot.on{background:var(--ok)}
 .muted{color:var(--muted)}
-.card{background:var(--card);border:.5px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
-.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
-.code{display:flex;gap:8px}
-.code span{font-family:ui-monospace,Consolas,monospace;font-size:30px;font-weight:600;background:var(--soft);border-radius:8px;padding:6px 14px;letter-spacing:.05em}
+.card{background:var(--card);border:.5px solid var(--line);border-radius:14px;padding:12px 16px;margin-bottom:10px}
+.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.code{display:flex;gap:6px}
+.code span{font-family:ui-monospace,Consolas,monospace;font-size:22px;font-weight:600;background:var(--soft);border-radius:8px;padding:4px 10px;letter-spacing:.05em}
+#devs{max-height:110px;overflow:auto}
+#jobs{max-height:190px;overflow:auto}
+#hist{max-height:140px;overflow:auto}
+details.card summary{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;cursor:pointer;user-select:none;list-style:none}
+details.card summary::-webkit-details-marker{display:none}
+details.card summary:after{content:"▸";float:right;color:var(--muted)}
+details.card[open] summary:after{content:"▾"}
+.gear{padding:8px 10px;font-size:15px;line-height:1}
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9;align-items:center;justify-content:center}
+.overlay.show{display:flex}
+.modal{background:var(--card);border:.5px solid var(--line);border-radius:14px;padding:18px 20px;width:min(440px,92vw)}
+.modal h2{font-size:14px;margin:0 0 10px;font-weight:600}
+.modal .foot{display:flex;justify-content:space-between;align-items:center;margin-top:14px}
 .dir{display:flex;align-items:center;gap:10px;margin-top:6px}
 .dir .path{font-family:ui-monospace,Consolas,monospace;font-size:13px;flex:1;min-width:0;background:var(--soft);color:var(--text);padding:8px 10px;border-radius:8px;border:.5px solid var(--line);outline:none}
 button{background:var(--soft);color:var(--text);border:.5px solid var(--line);border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
 button:hover{background:#383838}
-.dl{margin:14px 0}
-.dl-name{font-size:14px;margin-bottom:6px}
+.dl{margin:9px 0}
+.dl-name{font-size:14px;margin-bottom:5px}
 .bar{height:8px;border-radius:4px;background:var(--soft);overflow:hidden}
 .fill{height:100%;background:var(--fill);border-radius:4px;transition:width .4s}
 .meta{font-size:12px;color:var(--muted);margin-top:5px}
@@ -42,16 +55,15 @@ button:hover{background:#383838}
 .br-item:last-child{border-bottom:none}
 .br-ic{opacity:.7}
 </style></head><body>
-<div class="top"><span class="dot" id="dot"></span><h1>Lampa Downloader</h1><span class="muted" id="relay" style="margin-left:auto;font-size:13px"></span><button onclick="quit()" style="margin-left:14px">Выход</button></div>
+<div class="top"><span class="dot" id="dot"></span><h1>Lampa Downloader</h1><span class="muted" id="relay" style="margin-left:auto;font-size:13px"></span><button class="gear" onclick="settingsOpen()" title="Настройки" style="margin-left:14px">⚙</button><button onclick="quit()">Выход</button></div>
 
 <div class="card">
-  <div class="label">Код для Лампы</div>
-  <div class="code" id="code"></div>
-  <div style="margin-top:12px;display:flex;align-items:center;gap:10px">
-    <button id="pairBtn" onclick="openPair()">Разрешить подключение</button>
-    <span class="meta" id="pairState"></span>
+  <div class="label">Код для Лампы <span class="muted" style="text-transform:none;letter-spacing:0;float:right">Лампа → Настройки → Lampa Downloader</span></div>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <div class="code" id="code"></div>
+    <button id="pairBtn" onclick="openPair()" style="margin-left:auto">Разрешить подключение</button>
   </div>
-  <div class="muted" style="margin-top:10px;font-size:13px">Введите этот код в Лампе: Настройки → Lampa Downloader → Подключить ПК</div>
+  <div class="meta" id="pairState" style="min-height:15px"></div>
 </div>
 
 <div class="card">
@@ -64,17 +76,22 @@ button:hover{background:#383838}
   </div>
 </div>
 
-<div class="card">
-  <div class="label">Настройки</div>
-  <label class="sw"><input type="checkbox" id="st_seed"><span>Раздавать после скачивания</span></label>
-  <label class="sw"><input type="checkbox" id="st_auto"><span>Запускать вместе с системой</span></label>
-  <label class="sw"><input type="checkbox" id="st_part"><span>Оставлять недокачанные файлы при отмене</span></label>
+<div class="overlay" id="settings" onclick="if(event.target===this)settingsClose()">
+  <div class="modal">
+    <h2>Настройки</h2>
+    <label class="sw"><input type="checkbox" id="st_seed"><span>Раздавать после скачивания</span></label>
+    <label class="sw"><input type="checkbox" id="st_auto"><span>Запускать вместе с системой</span></label>
+    <label class="sw"><input type="checkbox" id="st_part"><span>Оставлять недокачанные файлы при отмене</span></label>
+    <div class="foot">
+      <button onclick="resetKey()" style="font-size:12px;color:#e05a5a">Сбросить ключ и код…</button>
+      <button onclick="settingsClose()">Закрыть</button>
+    </div>
+  </div>
 </div>
 
 <div class="card">
   <div class="label">Подключённые ТВ</div>
   <div id="devs"><div class="empty">Пока никто не подключён</div></div>
-  <div style="margin-top:12px"><button onclick="resetKey()" style="font-size:12px;color:#e05a5a">Сбросить ключ и код…</button></div>
 </div>
 
 <div class="card">
@@ -82,10 +99,11 @@ button:hover{background:#383838}
   <div id="jobs"><div class="empty">Пока пусто</div></div>
 </div>
 
-<div class="card">
-  <div class="label">История <button onclick="clearHist()" class="jb" style="float:right">Очистить</button></div>
-  <div id="hist"><div class="empty">Завершённых загрузок пока нет</div></div>
-</div>
+<details class="card" id="histCard">
+  <summary>История <span id="histN" class="muted" style="text-transform:none"></span></summary>
+  <div id="hist" style="margin-top:8px"><div class="empty">Завершённых загрузок пока нет</div></div>
+  <div style="margin-top:8px;text-align:right"><button onclick="clearHist()" class="jb">Очистить</button></div>
+</details>
 
 <script>
 function post(u){return fetch(u,{method:'POST'})}
@@ -143,9 +161,9 @@ function renderDevs(devs){
   if(devEditing!==null)return; // не перерисовывать под руками у пользователя
   if(!devs||!devs.length){box.innerHTML='<div class="empty">Пока никто не подключён</div>';return}
   box.innerHTML=devs.map(function(d,i){
-    return '<div class="dl" style="display:flex;align-items:center;gap:10px">'+
-      '<div style="flex:1;min-width:0"><div class="dl-name dev-name" data-i="'+i+'" title="Нажмите, чтобы переименовать" style="cursor:pointer">'+esc(d.name)+' ✎</div>'+
-      '<div class="meta">был на связи: '+fmtDate(d.last_seen)+'</div></div>'+
+    return '<div class="dl" style="display:flex;align-items:center;gap:10px;margin:6px 0">'+
+      '<span class="dl-name dev-name" data-i="'+i+'" title="Нажмите, чтобы переименовать" style="cursor:pointer;margin:0">'+esc(d.name)+' ✎</span>'+
+      '<span class="meta" style="margin:0 0 0 auto">'+fmtDate(d.last_seen)+'</span>'+
       '<button class="jb dev-del" data-i="'+i+'">Отключить</button></div>';
   }).join('');
   box._devs=devs;
@@ -180,6 +198,7 @@ function resetKey(){
 }
 function renderHist(hist){
   var box=document.getElementById('hist');
+  document.getElementById('histN').textContent=(hist&&hist.length)?'('+hist.length+')':'';
   if(!hist||!hist.length){box.innerHTML='<div class="empty">Завершённых загрузок пока нет</div>';return}
   box.innerHTML=hist.map(function(h){
     return '<div class="dl"><div class="dl-name">'+esc(h.name||'Загрузка')+'</div>'+
@@ -188,6 +207,9 @@ function renderHist(hist){
 }
 function clearHist(){if(confirm('Очистить историю? Файлы на диске останутся.')){post('/api/history/clear').then(tick)}}
 function openPair(){post('/api/pairmode').then(tick)}
+function settingsOpen(){document.getElementById('settings').classList.add('show')}
+function settingsClose(){document.getElementById('settings').classList.remove('show')}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')settingsClose()});
 function quit(){if(confirm('Закрыть Lampa Downloader? Загрузки остановятся.')){post('/api/quit');document.body.innerHTML='<p style=\"color:#8f8f8f;padding:20px\">Агент остановлен. Можно закрыть окно.</p>'}}
 function tick(){
   fetch('/api/state').then(r=>r.json()).then(d=>{
