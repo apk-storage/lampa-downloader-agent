@@ -2,11 +2,16 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base32"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/nacl/box"
 )
@@ -71,6 +76,9 @@ func TestMagnetValidation(t *testing.T) {
 	valid := []string{
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
 		"magnet:?xt=urn:btih:0123456789ABCDEF0123456789abcdef01234567&dn=Film",
+		// plain base32 BTIH is legal and was rejected by the old regex
+		"magnet:?xt=urn:btih:MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U",
+		"magnet:?xt=urn:btih:mfrggzdfmztwq2lknnwg23tpobyxe43u&tr=udp://x",
 	}
 	invalid := []string{
 		"",
@@ -78,16 +86,32 @@ func TestMagnetValidation(t *testing.T) {
 		"magnet:?xt=urn:btih:tooshort",
 		"magnet:?xt=urn:sha1:0123456789abcdef0123456789abcdef01234567",
 		"; rm -rf /",
+		// 40 hex + 32 junk glued together — the old regex ACCEPTED this
+		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567abcdefghijklmnopqrstuvwxyz234567",
+		// base32 length but illegal alphabet (0,1,8,9 are not base32)
+		"magnet:?xt=urn:btih:01890189018901890189018901890189",
 	}
 	for _, m := range valid {
-		if !magnetRe.MatchString(m) {
+		if !validMagnet(m) {
 			t.Errorf("valid magnet rejected: %q", m)
 		}
 	}
 	for _, m := range invalid {
-		if magnetRe.MatchString(m) {
+		if validMagnet(m) {
 			t.Errorf("invalid magnet accepted: %q", m)
 		}
+	}
+}
+
+// The same infohash in hex and base32 encodings must dedup to one key.
+func TestInfoHashCrossEncoding(t *testing.T) {
+	raw := []byte("abcdefghijklmnopqrst") // 20 bytes
+	hx := hex.EncodeToString(raw)
+	b32 := base32.StdEncoding.EncodeToString(raw)
+	a := infoHash("magnet:?xt=urn:btih:" + hx + "&dn=x")
+	b := infoHash("magnet:?xt=urn:btih:" + b32 + "&tr=udp://y")
+	if a == "" || a != b {
+		t.Fatalf("hex and base32 of the same hash must match: %q vs %q", a, b)
 	}
 }
 
@@ -141,13 +165,13 @@ func TestPendingAddRemove(t *testing.T) {
 	dir := t.TempDir()
 	a := &Agent{cfgPath: filepath.Join(dir, "agent.json")}
 
-	a.addPending("magnet:?xt=urn:btih:aaa", "Movies", "Film")
-	a.addPending("magnet:?xt=urn:btih:aaa", "Movies", "Film") // duplicate
+	a.addPending("id-a", "magnet:?xt=urn:btih:aaa", "Movies", "Film")
+	a.addPending("id-a2", "magnet:?xt=urn:btih:aaa", "Movies", "Film") // duplicate magnet
 	if len(a.cfg.Pending) != 1 {
 		t.Fatalf("duplicate pending job stored: %d entries", len(a.cfg.Pending))
 	}
 
-	a.addPending("magnet:?xt=urn:btih:bbb", "Shows", "Series")
+	a.addPending("id-b", "magnet:?xt=urn:btih:bbb", "Shows", "Series")
 	if len(a.cfg.Pending) != 2 {
 		t.Fatalf("want 2 pending jobs, got %d", len(a.cfg.Pending))
 	}
@@ -296,6 +320,122 @@ func TestRenameRevokeDevice(t *testing.T) {
 	a.revokeDevice(pubB)
 	if len(a.devices) != 0 {
 		t.Fatal("revoke did not remove the device")
+	}
+}
+
+// Concurrent config mutations from many goroutines must not corrupt the file
+// or trip the race detector (review P0-4).
+func TestConfigConcurrentSave(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for k := 0; k < 25; k++ {
+				a.addHistory(HistEntry{Name: "x", MiB: int64(n*100 + k)})
+			}
+		}(i)
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			pub := fmt.Sprintf("dev-%d", n)
+			a.mu.Lock()
+			a.devices[pub] = &Device{Pub: pub, Name: "ТВ"}
+			a.mu.Unlock()
+			for k := 0; k < 25; k++ {
+				a.touchDevice(pub)
+			}
+		}(i)
+	}
+	wg.Wait()
+	b, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		t.Fatalf("config corrupted by concurrent saves: %v", err)
+	}
+	if len(c.History) != historyCap {
+		t.Fatalf("history on disk: want %d, got %d", historyCap, len(c.History))
+	}
+}
+
+// A pending record keeps the original job ID so a restart resumes the job
+// under the same ID and the TV can re-link it.
+func TestPendingStableID(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}}
+	a.addPending("job-42", "magnet:?xt=urn:btih:ccc", "Movies", "Film")
+	b, _ := os.ReadFile(a.cfgPath)
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Pending) != 1 || c.Pending[0].ID != "job-42" {
+		t.Fatalf("pending ID not persisted: %+v", c.Pending)
+	}
+}
+
+// The cancel contract: cancelJob signals via cancelCh, the worker closes
+// doneCh on exit, and dismiss (done/seeding/error) never enters the
+// file-deletion path even with KeepFilesOnCancel=false.
+func TestCancelLifecycleContract(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{
+		cfgPath: filepath.Join(dir, "agent.json"),
+		jobs:    map[string]*Job{},
+		devices: map[string]*Device{},
+	}
+
+	// active job with a simulated worker
+	j := &Job{id: "a1", name: "Film", state: "downloading",
+		cancelCh: make(chan struct{}), doneCh: make(chan struct{})}
+	a.jobs["a1"] = j
+	workerExited := make(chan struct{})
+	go func() { // worker: exits when cancelled, then closes doneCh
+		<-j.cancelCh
+		close(j.doneCh)
+		close(workerExited)
+	}()
+	start := time.Now()
+	a.cancelJob("a1")
+	select {
+	case <-workerExited:
+	default:
+		t.Fatal("cancelJob returned before the worker exited")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("cancelJob waited too long for a cooperative worker")
+	}
+	if _, ok := a.jobs["a1"]; ok {
+		t.Fatal("cancelled job still in the map")
+	}
+	if !j.cancelled {
+		t.Fatal("cancelled flag not set")
+	}
+
+	// done job: dismiss must not wait on doneCh and must not touch files
+	sub := filepath.Join(dir, "Movies")
+	os.MkdirAll(sub, 0755)
+	f := filepath.Join(sub, "movie.mkv")
+	os.WriteFile(f, []byte("data"), 0644)
+	a.cfg.DownloadDir = dir
+	a.cfg.KeepFilesOnCancel = false // the dangerous default
+	d := &Job{id: "d1", name: "Done", state: "done", dir: "Movies",
+		cancelCh: make(chan struct{}), doneCh: make(chan struct{})} // doneCh open: worker "hung"
+	a.jobs["d1"] = d
+	fin := make(chan struct{})
+	go func() { a.cancelJob("d1"); close(fin) }()
+	select {
+	case <-fin:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dismiss of a done job blocked on doneCh")
+	}
+	if _, err := os.Stat(f); err != nil {
+		t.Fatal("dismiss deleted files of a completed download")
 	}
 }
 

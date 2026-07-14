@@ -7,6 +7,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,25 +72,59 @@ const historyCap = 50
 // PendingJob is persisted so an interrupted download resumes after a restart
 // (part files hold the data; re-adding rechecks and continues from disk).
 type PendingJob struct {
+	ID     string `json:"id,omitempty"` // stable across restarts so the TV re-links the same job
 	Magnet string `json:"magnet"`
 	Dir    string `json:"dir"`
 	Name   string `json:"name"`
 }
 
-var magnetRe = regexp.MustCompile(`^magnet:\?xt=urn:btih:[0-9A-Fa-f]{40}([0-9A-Za-z]{32})?.*`)
+var (
+	hex40Re = regexp.MustCompile(`^[0-9A-Fa-f]{40}$`)
+	// base32 alphabet is A-Z and 2-7 only (no 0/1/8/9)
+	b32Re = regexp.MustCompile(`^[A-Za-z2-7]{32}$`)
+	// btihRe extracts the infohash for job deduplication.
+	btihRe = regexp.MustCompile(`btih:([0-9A-Fa-f]{40}|[A-Za-z2-7]{32})`)
+)
 
-// btihRe extracts the infohash (hex-40 or base32-32) for job deduplication.
-var btihRe = regexp.MustCompile(`btih:([0-9A-Fa-f]{40}|[0-9A-Za-z]{32})`)
+// validMagnet parses the URI properly (net/url) and requires at least one
+// xt=urn:btih:<hash> where the hash is exactly 40 hex chars or exactly 32
+// base32 chars — the two legal BTIH encodings, mutually exclusive.
+func validMagnet(s string) bool {
+	if !strings.HasPrefix(s, "magnet:?") {
+		return false
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	for _, xt := range u.Query()["xt"] {
+		if h, ok := strings.CutPrefix(xt, "urn:btih:"); ok {
+			if hex40Re.MatchString(h) || b32Re.MatchString(h) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
-// infoHash returns the normalized infohash of a magnet, or "" if none found.
-// Two magnets with the same infohash are the same torrent regardless of
-// trackers/names, so this is the dedup key.
+// infoHash returns the infohash of a magnet normalized to lowercase hex
+// (base32 is decoded), or "" if none found. Two magnets with the same
+// infohash are the same torrent regardless of trackers/names/encoding,
+// so this is the dedup key.
 func infoHash(magnet string) string {
 	m := btihRe.FindStringSubmatch(magnet)
 	if m == nil {
 		return ""
 	}
-	return strings.ToLower(m[1])
+	h := m[1]
+	if len(h) == 40 {
+		return strings.ToLower(h)
+	}
+	raw, err := base32.StdEncoding.DecodeString(strings.ToUpper(h))
+	if err != nil || len(raw) != 20 {
+		return ""
+	}
+	return hex.EncodeToString(raw)
 }
 
 func deriveCode(pub []byte) string {
@@ -177,6 +213,13 @@ type Job struct {
 	pct    int
 	paused bool
 
+	// lifecycle: cancelled is set by cancelJob and makes the worker exit;
+	// cancelCh unblocks the metadata wait; doneCh is closed by the worker on
+	// exit so cancelJob can safely delete files only after it is gone.
+	cancelled bool
+	cancelCh  chan struct{}
+	doneCh    chan struct{}
+
 	// speed sampling
 	lastBytes int64
 	lastAt    time.Time
@@ -192,14 +235,17 @@ type Agent struct {
 
 	tc *torrent.Client
 
-	mu      sync.Mutex
-	jobs    map[string]*Job
-	devices map[string]*Device // by plugin pub (base64)
-	conn    *websocket.Conn    // current relay conn; closed on key reset to re-hello
-	relayUp bool
-	uiToken string
-	logPath string
-	started time.Time
+	mu       sync.Mutex
+	jobs     map[string]*Job
+	saveMu   sync.Mutex         // serializes config writes to disk
+	cfgSeq   uint64             // bumped per snapshot (under mu)
+	savedSeq uint64             // last snapshot on disk (under saveMu)
+	devices  map[string]*Device // by plugin pub (base64)
+	conn     *websocket.Conn    // current relay conn; closed on key reset to re-hello
+	relayUp  bool
+	uiToken  string
+	logPath  string
+	started  time.Time
 
 	outCh chan map[string]any // to current ws writer (best-effort)
 }
@@ -330,17 +376,29 @@ func (a *Agent) saveConfig() {
 		return a.cfg.Devices[i].Pub < a.cfg.Devices[j].Pub
 	})
 	b, merr := json.MarshalIndent(a.cfg, "", "  ")
+	a.cfgSeq++
+	seq := a.cfgSeq
 	a.mu.Unlock()
 	if merr != nil {
 		log.Printf("config save: %v", merr)
 		return
 	}
+	// Serialize writers: concurrent saves shared one tmp file and could rename
+	// a half-written snapshot into place. The seq check also drops a stale
+	// snapshot if a newer one has already reached disk.
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	if seq <= a.savedSeq {
+		return
+	}
 	if err := writeFileAtomic(a.cfgPath, b); err != nil {
 		log.Printf("config save: %v", err)
+		return
 	}
+	a.savedSeq = seq
 }
 
-func (a *Agent) addPending(magnet, dir, name string) {
+func (a *Agent) addPending(id, magnet, dir, name string) {
 	a.mu.Lock()
 	for _, p := range a.cfg.Pending {
 		if p.Magnet == magnet {
@@ -348,7 +406,7 @@ func (a *Agent) addPending(magnet, dir, name string) {
 			return
 		}
 	}
-	a.cfg.Pending = append(a.cfg.Pending, PendingJob{Magnet: magnet, Dir: dir, Name: name})
+	a.cfg.Pending = append(a.cfg.Pending, PendingJob{ID: id, Magnet: magnet, Dir: dir, Name: name})
 	a.mu.Unlock()
 	a.saveConfig()
 }
@@ -635,7 +693,7 @@ func (a *Agent) onJob(m map[string]any) {
 		log.Printf("job payload parse failed -> dropped")
 		return
 	}
-	if !magnetRe.MatchString(payload.Magnet) {
+	if !validMagnet(payload.Magnet) {
 		log.Printf("job magnet rejected (not a magnet URI) -> dropped")
 		return
 	}
@@ -692,29 +750,69 @@ func (a *Agent) resumeJob(id string) {
 }
 
 // cancelJob stops a download, removes it, and forgets it so it won't resume.
+// cancelJob handles the ✕ action; the semantics depend on the job's state.
+//
+//   - done / seeding / error → DISMISS: remove from the list, files are NEVER
+//     touched (seeding stops; error partials stay for manual cleanup);
+//   - connecting / downloading / paused → CANCEL: signal the worker, wait for
+//     it to exit, then apply the file policy (delete partials unless
+//     KeepFilesOnCancel).
+//
+// Completed data cannot be deleted from here by design — only a file manager
+// can do that.
 func (a *Agent) cancelJob(id string) {
 	a.mu.Lock()
 	j := a.jobs[id]
-	if j != nil {
-		delete(a.jobs, id)
+	if j == nil {
+		a.mu.Unlock()
+		return
+	}
+	delete(a.jobs, id)
+	state := j.state
+	if !j.cancelled {
+		j.cancelled = true
+		if j.cancelCh != nil {
+			close(j.cancelCh) // unblocks the metadata wait immediately
+		}
 	}
 	keep := a.cfg.KeepFilesOnCancel
 	base := filepath.Join(a.cfg.DownloadDir, j.dirOrEmpty())
+	t := j.t
 	a.mu.Unlock()
-	if j == nil {
-		return
-	}
 
-	// Collect file paths BEFORE dropping: after Drop the torrent is gone.
+	active := state == "connecting" || state == "downloading" || state == "paused"
+
+	// Collect file paths BEFORE dropping (needed only for the delete path).
 	var files []string
-	if j.t != nil {
+	if active && !keep && t != nil {
 		func() {
 			defer func() { _ = recover() }()
-			for _, f := range j.t.Files() {
+			for _, f := range t.Files() {
 				files = append(files, f.Path())
 			}
 		}()
-		func() { defer func() { _ = recover() }(); j.t.Drop() }()
+	}
+	if t != nil {
+		func() { defer func() { _ = recover() }(); t.Drop() }()
+	}
+
+	if !active {
+		log.Printf("job %s dismissed: %q (state %s, files untouched)", id, j.name, state)
+		if j.magnet != "" {
+			a.removePending(j.magnet)
+		}
+		a.pushStatus()
+		return
+	}
+
+	// Wait for the worker goroutine to exit before touching files, so nothing
+	// re-creates a .part behind our back mid-delete.
+	if j.doneCh != nil {
+		select {
+		case <-j.doneCh:
+		case <-time.After(3 * time.Second):
+			log.Printf("job %s: worker did not exit within 3s, proceeding", id)
+		}
 	}
 
 	if !keep {
@@ -794,12 +892,27 @@ func fileStorage(dir string) storage.ClientImpl {
 
 // failJob marks a job as failed with a human-readable reason, visible in the
 // panel and on the TV instead of a silent hang.
+// failJob is the single exit for every failure path: it marks the job, drops
+// the torrent from the engine (so an "error" never keeps downloading in the
+// background) and removes the pending record (so a restart doesn't silently
+// retry a job the user sees as failed). Partial files stay on disk.
 func (a *Agent) failJob(j *Job, reason string) {
 	a.mu.Lock()
+	if j.cancelled { // cancel owns the cleanup; don't fight over the corpse
+		a.mu.Unlock()
+		return
+	}
 	j.state = "error"
 	j.err = reason
 	j.speed = 0
+	t := j.t
 	a.mu.Unlock()
+	if t != nil {
+		func() { defer func() { _ = recover() }(); t.Drop() }()
+	}
+	if j.magnet != "" {
+		a.removePending(j.magnet)
+	}
 	a.pushStatus()
 	log.Printf("job %s failed: %q — %s", j.id, j.name, reason)
 }
@@ -820,9 +933,13 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 			}
 		}
 	}
-	j := &Job{id: id, name: name, magnet: magnet, dir: catDir, state: "connecting"}
+	j := &Job{
+		id: id, name: name, magnet: magnet, dir: catDir, state: "connecting",
+		cancelCh: make(chan struct{}), doneCh: make(chan struct{}),
+	}
 	a.jobs[id] = j
 	a.mu.Unlock()
+	defer close(j.doneCh) // cancelJob waits on this before touching files
 
 	if err := os.MkdirAll(target, 0755); err != nil {
 		a.failJob(j, dirErrRu(err))
@@ -844,35 +961,35 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 	j.t = t
 	a.mu.Unlock()
 
-	a.addPending(magnet, catDir, name) // persist so a restart resumes it
+	a.addPending(id, magnet, catDir, name) // persist so a restart resumes it, same ID
 	log.Printf("job %s queued: %q -> %s", id, name, target)
 
 	// Metadata (peer discovery) must arrive in reasonable time; otherwise the
 	// job would sit on "connecting" forever with no explanation.
 	select {
 	case <-t.GotInfo():
+	case <-j.cancelCh:
+		return // cancelJob owns cleanup
 	case <-time.After(5 * time.Minute):
 		a.failJob(j, "Не найдены пиры — раздача недоступна")
-		func() { defer func() { _ = recover() }(); t.Drop() }()
-		a.removePending(magnet)
 		return
 	}
 
-	total := t.Length()
+	var total int64
+	func() { defer func() { _ = recover() }(); total = t.Length() }()
 	if free, err := freeSpace(target); err == nil && free > 0 && free < total {
 		a.failJob(j, fmt.Sprintf("Недостаточно места: нужно %d ГиБ, свободно %d ГиБ",
 			total/(1<<30)+1, free/(1<<30)))
-		func() { defer func() { _ = recover() }(); t.Drop() }()
-		a.removePending(magnet)
 		return
 	}
 
-	t.DownloadAll()
+	func() { defer func() { _ = recover() }(); t.DownloadAll() }()
 	a.setState(j, "downloading")
 
 	stalledSince := time.Time{}
 	for {
-		done := t.BytesCompleted()
+		var done int64
+		func() { defer func() { _ = recover() }(); done = t.BytesCompleted() }()
 		pct := 0
 		if total > 0 {
 			pct = int(done * 100 / total)
@@ -880,7 +997,7 @@ func (a *Agent) startDownload(id, magnet, catDir, name string) {
 		now := time.Now()
 
 		a.mu.Lock()
-		if j.state == "error" { // cancelled or failed elsewhere
+		if j.cancelled || j.state == "error" { // cancelled or failed elsewhere
 			a.mu.Unlock()
 			return
 		}
@@ -1206,8 +1323,12 @@ func main() {
 	resume := append([]PendingJob(nil), a.cfg.Pending...)
 	a.mu.Unlock()
 	for _, p := range resume {
+		id := p.ID
+		if id == "" { // pending record saved by <= v1.0.7
+			id = randID()
+		}
 		log.Printf("resuming: %q", p.Name)
-		go a.startDownload(randID(), p.Magnet, p.Dir, p.Name)
+		go a.startDownload(id, p.Magnet, p.Dir, p.Name)
 	}
 
 	go a.connectLoop(*wsURL)
@@ -1238,7 +1359,7 @@ func (a *Agent) runSelfTest(arg string) {
 		}
 		spec = torrent.TorrentSpecFromMetaInfo(mi)
 	} else {
-		if !magnetRe.MatchString(arg) {
+		if !validMagnet(arg) {
 			log.Fatal("selftest: not a magnet URI or http(s) .torrent link")
 		}
 		var err error

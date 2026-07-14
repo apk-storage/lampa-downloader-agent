@@ -211,8 +211,11 @@ function tick(){
         ? '<button class="jb" data-act="resume" data-id="'+esc(j.id)+'">▶</button>'
         : '<button class="jb" data-act="pause"  data-id="'+esc(j.id)+'">❚❚</button>';
       var done=(j.state==='done'||j.state==='seeding'||err);
+      var xbtn=done
+        ? '<button class="jb" data-act="cancel" data-done="1" data-id="'+esc(j.id)+'">Убрать</button>'
+        : '<button class="jb" data-act="cancel" data-id="'+esc(j.id)+'">✕</button>';
       return '<div class="dl"><div class="dl-name">'+esc(j.name||('Загрузка '+j.id))+
-        '<span style="float:right">'+(done?'':pb)+'<button class="jb" data-act="cancel" data-id="'+esc(j.id)+'">✕</button></span></div>'+
+        '<span style="float:right">'+(done?'':pb)+xbtn+'</span></div>'+
         '<div class="bar"><div class="fill" style="width:'+pct+'%"></div></div>'+
         '<div class="meta"'+(err?' style="color:#e05a5a;opacity:1"':'')+'>'+bits.join(' · ')+'</div></div>';
     }).join('');
@@ -223,7 +226,12 @@ document.getElementById('jobs').addEventListener('click',function(e){
   var id=b.getAttribute('data-id'), act=b.getAttribute('data-act');
   if(act==='pause')  pauseJob(id);
   else if(act==='resume') resumeJob(id);
-  else if(act==='cancel' && confirm('Отменить эту загрузку?')) post('/api/cancel?id='+encodeURIComponent(id)).then(tick);
+  else if(act==='cancel'){
+    var msg=b.getAttribute('data-done')
+      ? 'Убрать из списка? Файлы на диске останутся.'
+      : 'Отменить эту загрузку?';
+    if(confirm(msg)) post('/api/cancel?id='+encodeURIComponent(id)).then(tick);
+  }
 });
 function loadSettings(){
   post('/api/settings').then(r=>r.json()).then(function(s){
