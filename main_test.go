@@ -518,3 +518,48 @@ func TestFreshTS(t *testing.T) {
 		t.Fatal("stale/future timestamp accepted")
 	}
 }
+
+func TestBuildMagnet(t *testing.T) {
+	m := buildMagnet("0123456789abcdef0123456789abcdef01234567", "Мой фильм (2026)",
+		[]string{"udp://tr.example:6969/announce", ""})
+	if !validMagnet(m) {
+		t.Fatalf("built magnet is invalid: %q", m)
+	}
+	if infoHash(m) != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatal("infohash lost in assembly")
+	}
+	if !strings.Contains(m, "dn=") || !strings.Contains(m, "tr=udp") {
+		t.Fatalf("dn/tr missing: %q", m)
+	}
+}
+
+func TestMagnetDisplayName(t *testing.T) {
+	if got := magnetDisplayName("magnet:?xt=urn:btih:" + strings.Repeat("a", 40) + "&dn=Film+2026"); got != "Film 2026" {
+		t.Fatalf("dn not extracted: %q", got)
+	}
+	if got := magnetDisplayName("magnet:?xt=urn:btih:" + strings.Repeat("a", 40)); got != "Загрузка" {
+		t.Fatalf("fallback name wrong: %q", got)
+	}
+	long := magnetDisplayName("magnet:?dn=" + strings.Repeat("x", 300))
+	if len([]rune(long)) > 121 {
+		t.Fatalf("long dn not truncated: %d runes", len([]rune(long)))
+	}
+}
+
+// Manual add: invalid magnets are rejected with a message, duplicates of an
+// active job are rejected with the existing job's name.
+func TestAddManualValidationAndDup(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{cfgPath: filepath.Join(dir, "agent.json"), devices: map[string]*Device{}, jobs: map[string]*Job{}}
+	if _, err := a.addManual("http://not-a-magnet", "Movies"); err == nil {
+		t.Fatal("invalid magnet accepted")
+	}
+	h := strings.Repeat("b", 40)
+	a.jobs["j1"] = &Job{id: "j1", name: "Кино", state: "downloading",
+		magnet: "magnet:?xt=urn:btih:" + h}
+	if err := a.launchManual("magnet:?xt=urn:btih:"+strings.ToUpper(h)+"&dn=x", "Movies", "x"); err == nil {
+		t.Fatal("duplicate of an active job accepted")
+	} else if !strings.Contains(err.Error(), "Кино") {
+		t.Fatalf("dup error must name the existing job: %v", err)
+	}
+}

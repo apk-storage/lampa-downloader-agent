@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -101,6 +102,38 @@ func (a *Agent) startUI(addr string) {
 	mux.HandleFunc("/api/history/clear", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		a.clearHistory()
 		w.Write([]byte("ok"))
+	}))
+	mux.HandleFunc("/api/add", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "ссылка слишком длинная"})
+			return
+		}
+		name, aerr := a.addManual(string(body), r.URL.Query().Get("cat"))
+		if aerr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": aerr.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "name": name})
+	}))
+	mux.HandleFunc("/api/addtorrent", a.mutate(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "файл слишком большой (лимит 10 МиБ)"})
+			return
+		}
+		name, aerr := a.addTorrentFile(body, r.URL.Query().Get("cat"))
+		if aerr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": aerr.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "name": name})
 	}))
 	mux.HandleFunc("/api/pairmode", a.mutate(func(w http.ResponseWriter, r *http.Request) {
 		a.openPairWindow(pairWindowDur)

@@ -39,6 +39,9 @@ button:hover{background:#383838}
 .meta{font-size:12px;color:var(--muted);margin-top:5px}
 .empty{color:var(--muted);font-size:14px;padding:6px 0}
 .jb{padding:2px 8px;font-size:12px;margin-left:6px}
+.addrow{display:flex;gap:8px;margin-bottom:6px}
+.addrow .path{padding:7px 10px}
+select{background:var(--soft);color:var(--text);border:.5px solid var(--line);border-radius:8px;padding:7px 8px;font-size:13px;cursor:pointer}
 .dirmsg{font-size:12px;margin-top:8px;min-height:16px;opacity:0;transition:opacity .2s}
 .dirmsg.show{opacity:1}
 .dirmsg.ok{color:#5aa15a}
@@ -96,6 +99,14 @@ button:hover{background:#383838}
 
 <div class="card">
   <div class="label">Загрузки</div>
+  <div class="addrow">
+    <input class="path" id="addMagnet" spellcheck="false" placeholder="magnet:?xt=… или файл .torrent">
+    <select id="addCat"><option value="Movies">Фильмы</option><option value="Shows">Сериалы</option><option value="Other" selected>Другое</option></select>
+    <button onclick="addFilePick()">Файл…</button>
+    <button onclick="addMagnet()">Добавить</button>
+    <input type="file" id="addTorrent" accept=".torrent,application/x-bittorrent" style="display:none">
+  </div>
+  <div id="addmsg" class="dirmsg"></div>
   <div id="jobs"><div class="empty">Пока пусто</div></div>
 </div>
 
@@ -207,6 +218,29 @@ function renderHist(hist){
 }
 function clearHist(){if(confirm('Очистить историю? Файлы на диске останутся.')){post('/api/history/clear').then(tick)}}
 function openPair(){post('/api/pairmode').then(tick)}
+function showAddMsg(t,ok){var m=document.getElementById('addmsg');m.textContent=t;m.className='dirmsg show '+(ok?'ok':'err');clearTimeout(m._t);m._t=setTimeout(function(){m.className='dirmsg'},5000)}
+function addMagnet(){
+  var inp=document.getElementById('addMagnet'),m=inp.value.trim();
+  if(!m){addFilePick();return}
+  fetch('/api/add?cat='+encodeURIComponent(document.getElementById('addCat').value),{method:'POST',body:m})
+    .then(function(r){return r.json()}).then(function(j){
+      if(j.ok){inp.value='';showAddMsg('Добавлено: '+(j.name||''),true);tick()}
+      else showAddMsg(j.error||'ошибка',false);
+    }).catch(function(){showAddMsg('нет связи с агентом',false)});
+}
+document.getElementById('addMagnet').addEventListener('keydown',function(e){if(e.key==='Enter')addMagnet()});
+function addFilePick(){document.getElementById('addTorrent').click()}
+document.getElementById('addTorrent').addEventListener('change',function(){
+  var f=this.files&&this.files[0];this.value='';
+  if(!f)return;
+  var cat=document.getElementById('addCat').value;
+  f.arrayBuffer().then(function(buf){
+    return fetch('/api/addtorrent?cat='+encodeURIComponent(cat),{method:'POST',body:buf});
+  }).then(function(r){return r.json()}).then(function(j){
+    if(j.ok){showAddMsg('Добавлено: '+(j.name||''),true);tick()}
+    else showAddMsg(j.error||'ошибка',false);
+  }).catch(function(){showAddMsg('нет связи с агентом',false)});
+});
 function settingsOpen(){document.getElementById('settings').classList.add('show')}
 function settingsClose(){document.getElementById('settings').classList.remove('show')}
 document.addEventListener('keydown',function(e){if(e.key==='Escape')settingsClose()});

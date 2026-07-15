@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
@@ -266,6 +267,102 @@ type Agent struct {
 	started    time.Time
 
 	outCh chan map[string]any // to current ws writer (best-effort)
+}
+
+// ---------- manual add (panel) ----------
+
+// magnetDisplayName extracts a human name from the dn= parameter.
+func magnetDisplayName(m string) string {
+	u, err := url.Parse(m)
+	if err != nil {
+		return "Загрузка"
+	}
+	dn := strings.TrimSpace(u.Query().Get("dn"))
+	if dn == "" {
+		return "Загрузка"
+	}
+	if r := []rune(dn); len(r) > 120 {
+		dn = string(r[:120]) + "…"
+	}
+	return dn
+}
+
+// buildMagnet assembles a magnet URI from parts (pure, testable).
+func buildMagnet(hashHex, name string, trackers []string) string {
+	m := "magnet:?xt=urn:btih:" + hashHex
+	if name != "" {
+		m += "&dn=" + url.QueryEscape(name)
+	}
+	for _, tr := range trackers {
+		if tr != "" {
+			m += "&tr=" + url.QueryEscape(tr)
+		}
+	}
+	return m
+}
+
+// addManual launches a magnet submitted through the panel.
+func (a *Agent) addManual(magnet, cat string) (string, error) {
+	magnet = strings.TrimSpace(magnet)
+	if !validMagnet(magnet) {
+		return "", fmt.Errorf("некорректная magnet-ссылка")
+	}
+	name := magnetDisplayName(magnet)
+	return name, a.launchManual(magnet, cat, name)
+}
+
+// addTorrentFile parses an uploaded .torrent and converts it to a magnet
+// (infohash + name + trackers), so the job goes through the exact same
+// pending/resume path as jobs from the TV.
+func (a *Agent) addTorrentFile(data []byte, cat string) (string, error) {
+	mi, err := metainfo.Load(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("не удалось разобрать .torrent")
+	}
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		return "", fmt.Errorf("не удалось разобрать .torrent")
+	}
+	name := strings.TrimSpace(info.Name)
+	if name == "" {
+		name = "Загрузка"
+	}
+	var trackers []string
+	seen := map[string]bool{}
+	if mi.Announce != "" {
+		trackers = append(trackers, mi.Announce)
+		seen[mi.Announce] = true
+	}
+	for _, tier := range mi.AnnounceList {
+		for _, tr := range tier {
+			if tr != "" && !seen[tr] {
+				trackers = append(trackers, tr)
+				seen[tr] = true
+			}
+		}
+	}
+	return name, a.launchManual(buildMagnet(mi.HashInfoBytes().HexString(), name, trackers), cat, name)
+}
+
+// launchManual dedups against active jobs (with feedback, unlike the silent
+// dedup inside startDownload) and starts the download.
+func (a *Agent) launchManual(magnet, cat, name string) error {
+	dir, ok := categoryDir[cat]
+	if !ok {
+		dir = "Other"
+	}
+	ih := infoHash(magnet)
+	a.mu.Lock()
+	for _, ex := range a.jobs {
+		if ih != "" && ex.state != "error" && infoHash(ex.magnet) == ih {
+			a.mu.Unlock()
+			return fmt.Errorf("этот торрент уже в загрузках: %s", ex.name)
+		}
+	}
+	a.mu.Unlock()
+	log.Printf("manual add: %q -> %s", name, dir)
+	go a.startDownload(randID(), magnet, dir, name)
+	return nil
 }
 
 // validKeys reports whether both keys decode to 32 bytes. Broken keys mean a
