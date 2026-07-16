@@ -563,3 +563,34 @@ func TestAddManualValidationAndDup(t *testing.T) {
 		t.Fatalf("dup error must name the existing job: %v", err)
 	}
 }
+
+// The hostname blob must decrypt on the plugin side with (pubA, pluginSecret)
+// and carry this machine's hostname.
+func TestSealHostnameRoundTrip(t *testing.T) {
+	aPub, aPriv, _ := box.GenerateKey(cryptoRand{})
+	pPub, pPriv, _ := box.GenerateKey(cryptoRand{})
+	a := &Agent{priv: aPriv, pub: aPub}
+	nonceB, ctB, err := a.sealHostname(b64(pPub[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonce [24]byte
+	copy(nonce[:], unb64(nonceB))
+	pt, ok := box.Open(nil, unb64(ctB), &nonce, aPub, pPriv)
+	if !ok {
+		t.Fatal("plugin-side decryption failed")
+	}
+	var o struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(pt, &o); err != nil || o.Name == "" {
+		t.Fatalf("bad name payload: %s", pt)
+	}
+	if host, _ := os.Hostname(); host != "" && o.Name != host {
+		t.Fatalf("name %q != hostname %q", o.Name, host)
+	}
+	// bad peer key must not panic, must error
+	if _, _, err := a.sealHostname("short"); err == nil {
+		t.Fatal("bad peer key accepted")
+	}
+}

@@ -704,9 +704,49 @@ func (a *Agent) acceptPair(pubB string) bool {
 }
 
 // onPairRequest answers the relay's pairing-v2 confirmation round-trip.
+// On success it attaches this PC's hostname, encrypted to the plugin, so the
+// TV can show a human receiver name instead of "ПК 1234". The relay still
+// sees only ciphertext.
 func (a *Agent) onPairRequest(m map[string]any) {
-	ok := a.acceptPair(str(m["pub"]))
-	a.send(map[string]any{"type": "pair_result", "id": str(m["id"]), "ok": ok})
+	pubB := str(m["pub"])
+	ok := a.acceptPair(pubB)
+	resp := map[string]any{"type": "pair_result", "id": str(m["id"]), "ok": ok}
+	if ok {
+		if nonceB, ctB, err := a.sealHostname(pubB); err == nil {
+			resp["nonce"], resp["ct"] = nonceB, ctB
+		}
+	}
+	a.send(resp)
+}
+
+// sealHostname box-encrypts {"name": <hostname>} to the plugin's key.
+func (a *Agent) sealHostname(pubB string) (nonceB64, ctB64 string, err error) {
+	host, _ := os.Hostname()
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "ПК"
+	}
+	if r := []rune(host); len(r) > 40 {
+		host = string(r[:40])
+	}
+	pt, err := json.Marshal(map[string]string{"name": host})
+	if err != nil {
+		return "", "", err
+	}
+	peerB := unb64(pubB)
+	if len(peerB) != 32 {
+		return "", "", fmt.Errorf("bad peer key")
+	}
+	var peer [32]byte
+	copy(peer[:], peerB)
+	var nonce [24]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", "", err
+	}
+	a.mu.Lock()
+	priv := a.priv
+	a.mu.Unlock()
+	return b64(nonce[:]), b64(box.Seal(nil, pt, &nonce, &peer, priv)), nil
 }
 
 // onPaired is the legacy path (old relay pushes "paired" without asking).
